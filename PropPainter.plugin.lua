@@ -1,0 +1,3808 @@
+if not plugin then
+	return
+end
+
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local Selection = game:GetService("Selection")
+local ServerStorage = game:GetService("ServerStorage")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local VERSION = "0.7.2"
+local LIBRARY_NAME = "PropPainterLibrary"
+local DEFAULT_PALETTE_NAME = "Default"
+local OUTPUT_NAME = "PropPainterOutput"
+local GENERATED_ATTRIBUTE = "PropPainterGenerated"
+local ASSET_ID_ATTRIBUTE = "PropPainterAssetId"
+local PIVOT_ATTRIBUTE = "PropPainterPlacementPivot"
+local TEMP_EDIT_NAME = "__PropPainterPivotEdit"
+
+local COLORS = {
+	background = Color3.fromRGB(30, 32, 36),
+	panel = Color3.fromRGB(42, 45, 50),
+	panelHover = Color3.fromRGB(55, 59, 65),
+	field = Color3.fromRGB(25, 27, 31),
+	accent = Color3.fromRGB(60, 126, 186),
+	accentHover = Color3.fromRGB(76, 148, 213),
+	text = Color3.fromRGB(238, 240, 243),
+	muted = Color3.fromRGB(170, 176, 184),
+	border = Color3.fromRGB(73, 78, 86),
+	danger = Color3.fromRGB(176, 76, 70),
+	pivot = Color3.fromRGB(255, 151, 38),
+}
+
+local currentPaletteName = DEFAULT_PALETTE_NAME
+local selectedAsset = nil
+local selectedAssets = {}
+local multiSelectMode = false
+local libraryCards = {}
+local placementActive = false
+local paintActive = false
+local eraseActive = false
+local strokeActive = false
+local strokeRecording = nil
+local strokeChanged = false
+local strokeLastPosition = nil
+local strokeSpatialIndex = nil
+local strokePlacedPositions = nil
+local previewModel = nil
+local previewAsset = nil
+local previewConnection = nil
+local previewSeed = 12345
+local previewHitPosition = nil
+local previewHitNormal = nil
+local pivotSession = nil
+local brushVisual = nil
+local brushHitPosition = nil
+local brushHitNormal = nil
+local brushConnection = nil
+local randomSource = Random.new(DateTime.now().UnixTimestampMillis % 2147483647)
+
+local settings = {
+	scaleMin = 1,
+	scaleMax = 1,
+	yawMin = 0,
+	yawMax = 360,
+	count = 20,
+	alignToSurface = true,
+	batchSurfaceMode = "Top",
+	brushRadius = 12,
+	brushDensity = 4,
+	minSpacing = 4,
+	useMinSpacing = true,
+	densityMode = "Maintain",
+	selectionControl = false,
+	selectionShift = false,
+	singleRotationDragging = false,
+	singleRotationLastX = nil,
+	singleYawOffset = 0,
+	singleRotationSnapEnabled = false,
+	rotationSnapAngle = 15,
+}
+
+settings.savePreferences = function()
+	pcall(function()
+		plugin:SetSetting("PropPainterSettingsV1", {
+			scaleMin = settings.scaleMin,
+			scaleMax = settings.scaleMax,
+			yawMin = settings.yawMin,
+			yawMax = settings.yawMax,
+			count = settings.count,
+			alignToSurface = settings.alignToSurface,
+			batchSurfaceMode = settings.batchSurfaceMode,
+			brushRadius = settings.brushRadius,
+			brushDensity = settings.brushDensity,
+			minSpacing = settings.minSpacing,
+			useMinSpacing = settings.useMinSpacing,
+			densityMode = settings.densityMode,
+			singleRotationSnapEnabled = settings.singleRotationSnapEnabled,
+			rotationSnapAngle = settings.rotationSnapAngle,
+			currentPaletteName = currentPaletteName,
+		})
+	end)
+end
+
+do
+	local ok, saved = pcall(function()
+		return plugin:GetSetting("PropPainterSettingsV1")
+	end)
+	if ok and type(saved) == "table" then
+		for _, key in ipairs({
+			"scaleMin",
+			"scaleMax",
+			"yawMin",
+			"yawMax",
+			"count",
+			"alignToSurface",
+			"batchSurfaceMode",
+			"brushRadius",
+			"brushDensity",
+			"minSpacing",
+			"useMinSpacing",
+			"densityMode",
+			"singleRotationSnapEnabled",
+			"rotationSnapAngle",
+		}) do
+			if saved[key] ~= nil then
+				settings[key] = saved[key]
+			end
+		end
+		if type(saved.currentPaletteName) == "string" and saved.currentPaletteName ~= "" then
+			currentPaletteName = saved.currentPaletteName
+		end
+	end
+	local presetOk, savedPresets = pcall(function()
+		return plugin:GetSetting("PropPainterPresetsV1")
+	end)
+	settings.presets = presetOk and type(savedPresets) == "table" and savedPresets or {}
+end
+
+local function keyCodeForDisplayedCharacter(character, fallback)
+	for _, keyCode in ipairs(Enum.KeyCode:GetEnumItems()) do
+		local ok, displayed = pcall(function()
+			return UserInputService:GetStringForKeyCode(keyCode)
+		end)
+		if ok and displayed == character then
+			return keyCode
+		end
+	end
+	return fallback
+end
+
+local brushDecreaseKey = keyCodeForDisplayedCharacter("[", Enum.KeyCode.LeftBracket)
+local brushIncreaseKey = keyCodeForDisplayedCharacter("]", Enum.KeyCode.RightBracket)
+
+local refreshLibrary
+local updateSelectedAssetUI
+local stopPlacement
+local stopBrushMode
+local finishPivotEdit
+local makePreview
+local updatePreview
+
+local function applyCorner(guiObject, radius)
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, radius or 5)
+	corner.Parent = guiObject
+end
+
+local function applyStroke(guiObject)
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = COLORS.border
+	stroke.Thickness = 1
+	stroke.Parent = guiObject
+end
+
+local UI_TEXT_SCALE = 1.18
+
+local function scaledTextSize(size)
+	return math.max(11, math.floor(size * UI_TEXT_SCALE + 0.5))
+end
+
+local function makeLabel(parent, text, height, textSize, color)
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.new(1, 0, 0, height or 24)
+	label.Font = Enum.Font.Gotham
+	label.Text = text
+	label.TextColor3 = color or COLORS.text
+	label.TextSize = scaledTextSize(textSize or 13)
+	label.TextWrapped = true
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Parent = parent
+	return label
+end
+
+local function makeButton(parent, text, height, accent)
+	local button = Instance.new("TextButton")
+	button.AutoButtonColor = false
+	button.BackgroundColor3 = accent and COLORS.accent or COLORS.panel
+	button.Size = UDim2.new(1, 0, 0, height or 36)
+	button.Font = Enum.Font.GothamMedium
+	button.Text = text
+	button.TextColor3 = COLORS.text
+	button.TextSize = scaledTextSize(13)
+	button.Parent = parent
+	applyCorner(button, 5)
+	applyStroke(button)
+	button.MouseEnter:Connect(function()
+		button.BackgroundColor3 = accent and COLORS.accentHover or COLORS.panelHover
+	end)
+	button.MouseLeave:Connect(function()
+		button.BackgroundColor3 = accent and COLORS.accent or COLORS.panel
+	end)
+	return button
+end
+
+local function makeSliderRow(parent, definition)
+	local row = Instance.new("Frame")
+	row.Name = "Property_" .. definition.key
+	row.BackgroundColor3 = COLORS.background
+	row.BorderSizePixel = 0
+	row.Size = UDim2.new(1, 0, 0, 56)
+	row.Parent = parent
+
+	local label = makeLabel(row, definition.label, 24, 12)
+	label.Position = UDim2.fromOffset(8, 1)
+	label.Size = UDim2.new(0.62, -8, 0, 24)
+
+	local field = Instance.new("TextBox")
+	field.Name = "Value_" .. definition.key
+	field.BackgroundColor3 = COLORS.field
+	field.ClearTextOnFocus = false
+	field.AnchorPoint = Vector2.new(1, 0)
+	field.Position = UDim2.new(1, -7, 0, 2)
+	field.Size = UDim2.new(0.34, 0, 0, 23)
+	field.Font = Enum.Font.GothamMedium
+	field.Text = definition.initial
+	field.TextColor3 = COLORS.text
+	field.PlaceholderColor3 = COLORS.muted
+	field.PlaceholderText = definition.suffix or ""
+	field.TextSize = scaledTextSize(12)
+	field.TextXAlignment = Enum.TextXAlignment.Center
+	field.Parent = row
+	applyCorner(field, 5)
+
+	local sliderButton = Instance.new("TextButton")
+	sliderButton.Name = "Slider_" .. definition.key
+	sliderButton.Active = true
+	sliderButton.AutoButtonColor = false
+	sliderButton.BackgroundTransparency = 1
+	sliderButton.Position = UDim2.fromOffset(8, 28)
+	sliderButton.Size = UDim2.new(1, -16, 0, 24)
+	sliderButton.Text = ""
+	sliderButton.ZIndex = 3
+	sliderButton.Parent = row
+
+	local track = Instance.new("Frame")
+	track.Name = "Track"
+	track.AnchorPoint = Vector2.new(0, 0.5)
+	track.BackgroundColor3 = COLORS.field
+	track.BorderSizePixel = 0
+	track.Position = UDim2.new(0, 0, 0.5, 0)
+	track.Size = UDim2.new(1, 0, 0, 6)
+	track.ZIndex = 3
+	track.Parent = sliderButton
+	applyCorner(track, 4)
+
+	local fill = Instance.new("Frame")
+	fill.Name = "Fill"
+	fill.BackgroundColor3 = COLORS.accent
+	fill.BorderSizePixel = 0
+	fill.Size = UDim2.new(0, 0, 1, 0)
+	fill.ZIndex = 4
+	fill.Parent = track
+	applyCorner(fill, 4)
+
+	local knob = Instance.new("Frame")
+	knob.Name = "Knob"
+	knob.AnchorPoint = Vector2.new(0.5, 0.5)
+	knob.BackgroundColor3 = COLORS.text
+	knob.BorderSizePixel = 0
+	knob.Position = UDim2.new(0, 0, 0.5, 0)
+	knob.Size = UDim2.fromOffset(14, 14)
+	knob.ZIndex = 5
+	knob.Parent = track
+	applyCorner(knob, 8)
+	applyStroke(knob)
+
+	return {
+		row = row,
+		label = label,
+		field = field,
+		sliderButton = sliderButton,
+		fill = fill,
+		knob = knob,
+	}
+end
+
+local function makePropertyCategory(parent, titleText, descriptionText, expandedByDefault)
+	local category = Instance.new("Frame")
+	category.Name = "Category_" .. titleText
+	category.BackgroundColor3 = COLORS.panel
+	category.BorderSizePixel = 0
+	category.Size = UDim2.new(1, 0, 0, 0)
+	category.AutomaticSize = Enum.AutomaticSize.Y
+	category.Parent = parent
+	applyCorner(category, 5)
+	applyStroke(category)
+
+	local categoryLayout = Instance.new("UIListLayout")
+	categoryLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	categoryLayout.Parent = category
+
+	local header = Instance.new("TextButton")
+	header.Name = "Header"
+	header.AutoButtonColor = false
+	header.BackgroundColor3 = COLORS.panel
+	header.BorderSizePixel = 0
+	header.Size = UDim2.new(1, 0, 0, 34)
+	header.Font = Enum.Font.GothamMedium
+	header.TextColor3 = COLORS.text
+	header.TextSize = scaledTextSize(13)
+	header.TextXAlignment = Enum.TextXAlignment.Left
+	header.Parent = category
+
+	local content = Instance.new("Frame")
+	content.Name = "Content"
+	content.BackgroundColor3 = COLORS.background
+	content.BorderSizePixel = 0
+	content.Size = UDim2.new(1, 0, 0, 0)
+	content.AutomaticSize = Enum.AutomaticSize.Y
+	content.Parent = category
+
+	local contentPadding = Instance.new("UIPadding")
+	contentPadding.PaddingTop = UDim.new(0, 4)
+	contentPadding.PaddingBottom = UDim.new(0, 5)
+	contentPadding.PaddingLeft = UDim.new(0, 5)
+	contentPadding.PaddingRight = UDim.new(0, 5)
+	contentPadding.Parent = content
+
+	local contentLayout = Instance.new("UIListLayout")
+	contentLayout.Padding = UDim.new(0, 2)
+	contentLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	contentLayout.Parent = content
+
+	local description = makeLabel(content, descriptionText, 22, 10, COLORS.muted)
+
+	local expanded = expandedByDefault == true
+	local function render()
+		content.Visible = expanded
+		header.Text = (expanded and "  ▼  " or "  ▶  ") .. titleText
+		header.BackgroundColor3 = expanded and COLORS.panelHover or COLORS.panel
+	end
+	header.Activated:Connect(function()
+		expanded = not expanded
+		render()
+	end)
+	render()
+	return content, header
+end
+
+local NUMERIC_DEFINITIONS = {
+	{ key = "scaleMin", label = "サイズ 最小", min = 0.05, max = 20, step = 0.05, digits = 2, curve = 2, initial = "1.00" },
+	{ key = "scaleMax", label = "サイズ 最大", min = 0.05, max = 20, step = 0.05, digits = 2, curve = 2, initial = "1.00" },
+	{ key = "yawMin", label = "Y回転 最小", min = -360, max = 360, step = 1, digits = 0, suffix = "°", initial = "0" },
+	{ key = "yawMax", label = "Y回転 最大", min = -360, max = 360, step = 1, digits = 0, suffix = "°", initial = "360" },
+	{ key = "rotationSnapAngle", label = "単体回転 スナップ角度", min = 1, max = 180, step = 1, digits = 0, suffix = "°", initial = "15" },
+	{ key = "weight", label = "主選択プロップの出現重み", min = 0, max = 2, step = 0.01, digits = 2, initial = "1.00" },
+	{ key = "brushRadius", label = "ブラシ半径", min = 0.5, max = 500, step = 0.5, digits = 2, curve = 3, suffix = "Stud", initial = "12.00" },
+	{ key = "brushDensity", label = "1スタンプの生成試行数", min = 1, max = 200, step = 1, digits = 0, initial = "4" },
+	{ key = "minSpacing", label = "最小間隔", min = 0, max = 500, step = 0.5, digits = 2, curve = 3, suffix = "Stud", initial = "4.00" },
+	{ key = "count", label = "一括生成数", min = 1, max = 1000, step = 1, digits = 0, initial = "20" },
+}
+
+local NUMERIC_BY_KEY = {}
+for _, definition in ipairs(NUMERIC_DEFINITIONS) do
+	NUMERIC_BY_KEY[definition.key] = definition
+end
+
+local toolbar = plugin:CreateToolbar("Prop Painter")
+local toolbarButton = toolbar:CreateButton(
+	"PropPainterOpen",
+	"Prop Painterを開く",
+	"",
+	"Prop Painter"
+)
+
+local widgetInfo = DockWidgetPluginGuiInfo.new(
+	Enum.InitialDockState.Left,
+	false,
+	false,
+	400,
+	720,
+	340,
+	500
+)
+
+local widget = plugin:CreateDockWidgetPluginGuiAsync("PropPainterDockV1", widgetInfo)
+widget.Title = "Prop Painter"
+
+local rootFrame = Instance.new("Frame")
+rootFrame.BackgroundColor3 = COLORS.background
+rootFrame.BorderSizePixel = 0
+rootFrame.Size = UDim2.fromScale(1, 1)
+rootFrame.Parent = widget
+
+local tabBar = Instance.new("Frame")
+tabBar.BackgroundTransparency = 1
+tabBar.Position = UDim2.fromOffset(10, 8)
+tabBar.Size = UDim2.new(1, -20, 0, 36)
+tabBar.Parent = rootFrame
+
+local libraryTabButton = makeButton(tabBar, "ライブラリ", 36, false)
+libraryTabButton.Position = UDim2.fromScale(0, 0)
+libraryTabButton.Size = UDim2.new(1 / 3, -4, 1, 0)
+
+local placementTabButton = makeButton(tabBar, "配置", 36, false)
+placementTabButton.Position = UDim2.new(1 / 3, 2, 0, 0)
+placementTabButton.Size = UDim2.new(1 / 3, -4, 1, 0)
+
+settings.managementTabButton = makeButton(tabBar, "生成済み", 36, false)
+settings.managementTabButton.Position = UDim2.new(2 / 3, 4, 0, 0)
+settings.managementTabButton.Size = UDim2.new(1 / 3, -4, 1, 0)
+
+local libraryPanel = Instance.new("Frame")
+libraryPanel.BackgroundTransparency = 1
+libraryPanel.Position = UDim2.fromOffset(10, 52)
+libraryPanel.Size = UDim2.new(1, -20, 1, -62)
+libraryPanel.Parent = rootFrame
+
+local placementPanel = Instance.new("ScrollingFrame")
+placementPanel.BackgroundTransparency = 1
+placementPanel.BorderSizePixel = 0
+placementPanel.Position = UDim2.fromOffset(10, 52)
+placementPanel.Size = UDim2.new(1, -20, 1, -62)
+placementPanel.ScrollBarThickness = 6
+placementPanel.ScrollBarImageColor3 = COLORS.border
+placementPanel.AutomaticCanvasSize = Enum.AutomaticSize.Y
+placementPanel.CanvasSize = UDim2.new()
+placementPanel.Visible = false
+placementPanel.Parent = rootFrame
+
+settings.managementPanel = Instance.new("Frame")
+settings.managementPanel.BackgroundTransparency = 1
+settings.managementPanel.Position = UDim2.fromOffset(10, 52)
+settings.managementPanel.Size = UDim2.new(1, -20, 1, -62)
+settings.managementPanel.Visible = false
+settings.managementPanel.Parent = rootFrame
+
+do
+	local title = makeLabel(settings.managementPanel, "生成済みプロップ", 28, 16)
+	title.Font = Enum.Font.GothamBold
+
+	settings.managementSummary = makeLabel(
+		settings.managementPanel,
+		"生成済みプロップはありません",
+		38,
+		12,
+		COLORS.muted
+	)
+	settings.managementSummary.Position = UDim2.fromOffset(0, 34)
+	settings.managementSummary.BackgroundColor3 = COLORS.panel
+	settings.managementSummary.BackgroundTransparency = 0
+	settings.managementSummary.TextXAlignment = Enum.TextXAlignment.Center
+	applyCorner(settings.managementSummary, 5)
+	applyStroke(settings.managementSummary)
+
+	settings.managementRefreshButton = makeButton(settings.managementPanel, "一覧を更新", 36, false)
+	settings.managementRefreshButton.Position = UDim2.fromOffset(0, 78)
+	settings.managementRefreshButton.Size = UDim2.new(0.5, -3, 0, 36)
+
+	settings.managementSelectAllButton = makeButton(settings.managementPanel, "すべて選択", 36, true)
+	settings.managementSelectAllButton.Position = UDim2.new(0.5, 3, 0, 78)
+	settings.managementSelectAllButton.Size = UDim2.new(0.5, -3, 0, 36)
+
+	settings.managementReapplyButton = makeButton(settings.managementPanel, "設定を再適用", 36, false)
+	settings.managementReapplyButton.Position = UDim2.fromOffset(0, 120)
+	settings.managementReapplyButton.Size = UDim2.new(0.5, -3, 0, 36)
+
+	settings.managementRandomizeButton = makeButton(settings.managementPanel, "再ランダム化", 36, true)
+	settings.managementRandomizeButton.Position = UDim2.new(0.5, 3, 0, 120)
+	settings.managementRandomizeButton.Size = UDim2.new(0.5, -3, 0, 36)
+
+	settings.managementList = Instance.new("ScrollingFrame")
+	settings.managementList.BackgroundColor3 = COLORS.field
+	settings.managementList.BorderSizePixel = 0
+	settings.managementList.Position = UDim2.fromOffset(0, 164)
+	settings.managementList.Size = UDim2.new(1, 0, 1, -214)
+	settings.managementList.ScrollBarThickness = 6
+	settings.managementList.ScrollBarImageColor3 = COLORS.border
+	settings.managementList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	settings.managementList.CanvasSize = UDim2.new()
+	settings.managementList.Parent = settings.managementPanel
+	applyCorner(settings.managementList, 5)
+	applyStroke(settings.managementList)
+
+	local padding = Instance.new("UIPadding")
+	padding.PaddingTop = UDim.new(0, 6)
+	padding.PaddingBottom = UDim.new(0, 6)
+	padding.PaddingLeft = UDim.new(0, 6)
+	padding.PaddingRight = UDim.new(0, 6)
+	padding.Parent = settings.managementList
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 6)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = settings.managementList
+
+	settings.managementStatus = makeLabel(settings.managementPanel, "種類をクリックするとStudio上で選択できます", 42, 11, COLORS.muted)
+	settings.managementStatus.AnchorPoint = Vector2.new(0, 1)
+	settings.managementStatus.Position = UDim2.new(0, 0, 1, 0)
+	settings.managementStatus.BackgroundColor3 = COLORS.panel
+	settings.managementStatus.BackgroundTransparency = 0
+	settings.managementStatus.TextXAlignment = Enum.TextXAlignment.Center
+	settings.managementStatus.TextYAlignment = Enum.TextYAlignment.Center
+	applyCorner(settings.managementStatus, 5)
+	applyStroke(settings.managementStatus)
+end
+
+local placementLayout = Instance.new("UIListLayout")
+placementLayout.Padding = UDim.new(0, 7)
+placementLayout.SortOrder = Enum.SortOrder.LayoutOrder
+placementLayout.Parent = placementPanel
+
+local libraryTitle = makeLabel(libraryPanel, "プロップライブラリ", 26, 16)
+libraryTitle.Font = Enum.Font.GothamBold
+
+local paletteButton = makeButton(libraryPanel, "", 34, false)
+paletteButton.Position = UDim2.fromOffset(0, 30)
+
+local addSelectionButton = makeButton(libraryPanel, "選択物を個別プロップとして追加", 36, true)
+addSelectionButton.Position = UDim2.fromOffset(0, 70)
+addSelectionButton.Size = UDim2.new(0.69, -3, 0, 36)
+
+local refreshButton = makeButton(libraryPanel, "更新", 36, false)
+refreshButton.Position = UDim2.new(0.69, 3, 0, 70)
+refreshButton.Size = UDim2.new(0.31, -3, 0, 36)
+
+local librarySelectionLabel = makeLabel(libraryPanel, "プロップを選択してください", 34, 11, COLORS.muted)
+librarySelectionLabel.Position = UDim2.fromOffset(0, 112)
+librarySelectionLabel.Size = UDim2.new(0.63, -3, 0, 34)
+librarySelectionLabel.BackgroundColor3 = COLORS.panel
+librarySelectionLabel.BackgroundTransparency = 0
+librarySelectionLabel.TextXAlignment = Enum.TextXAlignment.Center
+librarySelectionLabel.TextYAlignment = Enum.TextYAlignment.Center
+applyCorner(librarySelectionLabel, 5)
+applyStroke(librarySelectionLabel)
+
+local multiSelectModeButton = makeButton(libraryPanel, "単一選択", 34, false)
+multiSelectModeButton.Position = UDim2.new(0.63, 3, 0, 112)
+multiSelectModeButton.Size = UDim2.new(0.37, -3, 0, 34)
+multiSelectModeButton.TextSize = scaledTextSize(11)
+
+local pivotEditButton = makeButton(libraryPanel, "配置Pivotを編集", 34, false)
+pivotEditButton.Position = UDim2.fromOffset(0, 152)
+pivotEditButton.Size = UDim2.new(0.5, -3, 0, 34)
+
+local goPlacementButton = makeButton(libraryPanel, "配置設定へ", 34, true)
+goPlacementButton.Position = UDim2.new(0.5, 3, 0, 152)
+goPlacementButton.Size = UDim2.new(0.5, -3, 0, 34)
+
+local pivotActions = Instance.new("Frame")
+pivotActions.BackgroundTransparency = 1
+pivotActions.Position = UDim2.fromOffset(0, 192)
+pivotActions.Size = UDim2.new(1, 0, 0, 34)
+pivotActions.Visible = false
+pivotActions.Parent = libraryPanel
+
+local pivotSaveButton = makeButton(pivotActions, "保存して終了", 34, true)
+pivotSaveButton.Size = UDim2.new(0.38, -3, 1, 0)
+
+local pivotResetButton = makeButton(pivotActions, "底面へリセット", 34, false)
+pivotResetButton.Position = UDim2.new(0.38, 3, 0, 0)
+pivotResetButton.Size = UDim2.new(0.36, -6, 1, 0)
+pivotResetButton.TextSize = scaledTextSize(11)
+
+local pivotCancelButton = makeButton(pivotActions, "キャンセル", 34, false)
+pivotCancelButton.Position = UDim2.new(0.74, 3, 0, 0)
+pivotCancelButton.Size = UDim2.new(0.26, -3, 1, 0)
+pivotCancelButton.TextSize = scaledTextSize(11)
+
+settings.activeWeightPanel = Instance.new("Frame")
+settings.activeWeightPanel.BackgroundColor3 = COLORS.panel
+settings.activeWeightPanel.BorderSizePixel = 0
+settings.activeWeightPanel.Position = UDim2.fromOffset(0, 192)
+settings.activeWeightPanel.Size = UDim2.new(1, 0, 0, 180)
+settings.activeWeightPanel.Parent = libraryPanel
+applyCorner(settings.activeWeightPanel, 5)
+applyStroke(settings.activeWeightPanel)
+
+settings.activeWeightTitle = makeLabel(
+	settings.activeWeightPanel,
+	"有効プロップ：重み・個別設定",
+	25,
+	11,
+	COLORS.text
+)
+settings.activeWeightTitle.Position = UDim2.fromOffset(7, 2)
+
+settings.activeWeightList = Instance.new("ScrollingFrame")
+settings.activeWeightList.BackgroundColor3 = COLORS.field
+settings.activeWeightList.BorderSizePixel = 0
+settings.activeWeightList.Position = UDim2.fromOffset(6, 29)
+settings.activeWeightList.Size = UDim2.new(1, -12, 1, -35)
+settings.activeWeightList.ScrollBarThickness = 5
+settings.activeWeightList.ScrollBarImageColor3 = COLORS.border
+settings.activeWeightList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+settings.activeWeightList.CanvasSize = UDim2.new()
+settings.activeWeightList.Parent = settings.activeWeightPanel
+applyCorner(settings.activeWeightList, 4)
+
+do
+	local padding = Instance.new("UIPadding")
+	padding.PaddingTop = UDim.new(0, 5)
+	padding.PaddingBottom = UDim.new(0, 5)
+	padding.PaddingLeft = UDim.new(0, 5)
+	padding.PaddingRight = UDim.new(0, 5)
+	padding.Parent = settings.activeWeightList
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 5)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = settings.activeWeightList
+end
+
+local assetGrid = Instance.new("ScrollingFrame")
+assetGrid.BackgroundColor3 = COLORS.field
+assetGrid.BorderSizePixel = 0
+assetGrid.Position = UDim2.fromOffset(0, 378)
+assetGrid.Size = UDim2.new(1, 0, 1, -426)
+assetGrid.ScrollBarThickness = 6
+assetGrid.ScrollBarImageColor3 = COLORS.border
+assetGrid.AutomaticCanvasSize = Enum.AutomaticSize.Y
+assetGrid.CanvasSize = UDim2.new()
+assetGrid.Parent = libraryPanel
+applyCorner(assetGrid, 5)
+applyStroke(assetGrid)
+
+local gridPadding = Instance.new("UIPadding")
+gridPadding.PaddingTop = UDim.new(0, 6)
+gridPadding.PaddingBottom = UDim.new(0, 6)
+gridPadding.PaddingLeft = UDim.new(0, 6)
+gridPadding.PaddingRight = UDim.new(0, 6)
+gridPadding.Parent = assetGrid
+
+local gridLayout = Instance.new("UIGridLayout")
+gridLayout.CellPadding = UDim2.fromOffset(6, 6)
+gridLayout.CellSize = UDim2.new(0.5, -9, 0, 128)
+gridLayout.SortOrder = Enum.SortOrder.Name
+gridLayout.Parent = assetGrid
+
+local libraryStatusLabel = makeLabel(libraryPanel, "準備完了", 42, 11, COLORS.muted)
+libraryStatusLabel.AnchorPoint = Vector2.new(0, 1)
+libraryStatusLabel.Position = UDim2.new(0, 0, 1, 0)
+libraryStatusLabel.BackgroundColor3 = COLORS.panel
+libraryStatusLabel.BackgroundTransparency = 0
+libraryStatusLabel.TextXAlignment = Enum.TextXAlignment.Center
+libraryStatusLabel.TextYAlignment = Enum.TextYAlignment.Center
+applyCorner(libraryStatusLabel, 5)
+applyStroke(libraryStatusLabel)
+
+local placementTitle = makeLabel(placementPanel, "配置設定", 26, 16)
+placementTitle.Font = Enum.Font.GothamBold
+
+local placementAssetLabel = makeLabel(placementPanel, "選択中: なし", 38, 12, COLORS.muted)
+placementAssetLabel.BackgroundColor3 = COLORS.panel
+placementAssetLabel.BackgroundTransparency = 0
+placementAssetLabel.TextXAlignment = Enum.TextXAlignment.Center
+placementAssetLabel.TextYAlignment = Enum.TextYAlignment.Center
+applyCorner(placementAssetLabel, 5)
+applyStroke(placementAssetLabel)
+
+local numericControls = {}
+local singlePlacementButton, paintButton, eraseButton
+local scaleMinField, scaleMaxField, yawMinField, yawMaxField, alignButton
+local brushRadiusField, brushDensityField, minSpacingField, densityModeButton, spacingButton
+local weightField
+local countField, surfaceModeButton, batchButton
+local placementPivotButton, backLibraryButton
+
+do
+	local function addNumericControl(parent, key)
+		local control = makeSliderRow(parent, NUMERIC_BY_KEY[key])
+		numericControls[key] = control
+		return control.field
+	end
+
+	local modeCategory = makePropertyCategory(
+		placementPanel,
+		"配置モード",
+		"単体配置、ペイント、消しゴムを直接切り替え",
+		true
+	)
+	local modeButtons = Instance.new("Frame")
+	modeButtons.BackgroundTransparency = 1
+	modeButtons.Size = UDim2.new(1, 0, 0, 40)
+	modeButtons.Parent = modeCategory
+	singlePlacementButton = makeButton(modeButtons, "単体配置", 40, true)
+	singlePlacementButton.Size = UDim2.new(1 / 3, -4, 1, 0)
+	singlePlacementButton.TextSize = scaledTextSize(10)
+	paintButton = makeButton(modeButtons, "ペイント", 40, true)
+	paintButton.Position = UDim2.new(1 / 3, 2, 0, 0)
+	paintButton.Size = UDim2.new(1 / 3, -4, 1, 0)
+	paintButton.TextSize = scaledTextSize(10)
+	eraseButton = makeButton(modeButtons, "消しゴム", 40, false)
+	eraseButton.Position = UDim2.new(2 / 3, 4, 0, 0)
+	eraseButton.Size = UDim2.new(1 / 3, -4, 1, 0)
+	eraseButton.TextSize = scaledTextSize(10)
+
+	local presetCategory = makePropertyCategory(
+		placementPanel,
+		"プリセット",
+		"選択プロップと配置設定を保存・読込",
+		false
+	)
+	settings.presetCycleButton = makeButton(presetCategory, "プリセット: なし", 34, false)
+	settings.presetNameField = Instance.new("TextBox")
+	settings.presetNameField.BackgroundColor3 = COLORS.field
+	settings.presetNameField.ClearTextOnFocus = false
+	settings.presetNameField.Size = UDim2.new(1, 0, 0, 34)
+	settings.presetNameField.Font = Enum.Font.GothamMedium
+	settings.presetNameField.PlaceholderText = "プリセット名"
+	settings.presetNameField.Text = "新しいプリセット"
+	settings.presetNameField.TextColor3 = COLORS.text
+	settings.presetNameField.PlaceholderColor3 = COLORS.muted
+	settings.presetNameField.TextSize = scaledTextSize(12)
+	settings.presetNameField.Parent = presetCategory
+	applyCorner(settings.presetNameField, 5)
+	applyStroke(settings.presetNameField)
+
+	local presetActions = Instance.new("Frame")
+	presetActions.BackgroundTransparency = 1
+	presetActions.Size = UDim2.new(1, 0, 0, 34)
+	presetActions.Parent = presetCategory
+	settings.presetSaveButton = makeButton(presetActions, "保存", 34, true)
+	settings.presetSaveButton.Size = UDim2.new(1 / 3, -4, 1, 0)
+	settings.presetLoadButton = makeButton(presetActions, "読込", 34, false)
+	settings.presetLoadButton.Position = UDim2.new(1 / 3, 2, 0, 0)
+	settings.presetLoadButton.Size = UDim2.new(1 / 3, -4, 1, 0)
+	settings.presetDeleteButton = makeButton(presetActions, "削除", 34, false)
+	settings.presetDeleteButton.Position = UDim2.new(2 / 3, 4, 0, 0)
+	settings.presetDeleteButton.Size = UDim2.new(1 / 3, -4, 1, 0)
+
+	local transformCategory = makePropertyCategory(
+		placementPanel,
+		"サイズ・回転・面追従",
+		"ランダム範囲と配置方向",
+		true
+	)
+	scaleMinField = addNumericControl(transformCategory, "scaleMin")
+	scaleMaxField = addNumericControl(transformCategory, "scaleMax")
+	yawMinField = addNumericControl(transformCategory, "yawMin")
+	yawMaxField = addNumericControl(transformCategory, "yawMax")
+	addNumericControl(transformCategory, "rotationSnapAngle")
+	settings.rotationSnapButton = makeButton(transformCategory, "", 36, false)
+	alignButton = makeButton(transformCategory, "", 36, false)
+
+	local brushCategory = makePropertyCategory(
+		placementPanel,
+		"ペイントブラシ",
+		"範囲、密度、重なり方",
+		true
+	)
+	brushRadiusField = addNumericControl(brushCategory, "brushRadius")
+	brushDensityField = addNumericControl(brushCategory, "brushDensity")
+	minSpacingField = addNumericControl(brushCategory, "minSpacing")
+	densityModeButton = makeButton(brushCategory, "", 36, false)
+	spacingButton = makeButton(brushCategory, "", 36, false)
+
+	local mixCategory = makePropertyCategory(
+		placementPanel,
+		"複数プロップの出現率",
+		"主選択プロップの抽選ウェイト",
+		false
+	)
+	weightField = addNumericControl(mixCategory, "weight")
+
+	local batchCategory = makePropertyCategory(
+		placementPanel,
+		"選択範囲へ一括生成",
+		"生成数と対象面",
+		false
+	)
+	countField = addNumericControl(batchCategory, "count")
+	surfaceModeButton = makeButton(batchCategory, "", 36, false)
+	batchButton = makeButton(batchCategory, "選択範囲へ一括生成", 40, true)
+
+	local toolsCategory = makePropertyCategory(
+		placementPanel,
+		"Pivotとライブラリ",
+		"配置基準点の編集とライブラリへ戻る",
+		false
+	)
+	placementPivotButton = makeButton(toolsCategory, "選択プロップの配置Pivotを編集", 36, false)
+	backLibraryButton = makeButton(toolsCategory, "ライブラリへ戻る", 34, false)
+end
+
+local placementHelp = makeLabel(
+	placementPanel,
+	"Ctrl/Shift+クリックで複数選択。単体配置は左ドラッグでY回転、離して確定。\n単体サイズ／ブラシ半径: [ 縮小 / ] 拡大。Escでツールを終了。",
+	82,
+	11,
+	COLORS.muted
+)
+placementHelp.TextYAlignment = Enum.TextYAlignment.Top
+
+local placementStatusLabel = makeLabel(placementPanel, "準備完了", 48, 11, COLORS.muted)
+placementStatusLabel.BackgroundColor3 = COLORS.panel
+placementStatusLabel.BackgroundTransparency = 0
+placementStatusLabel.TextXAlignment = Enum.TextXAlignment.Center
+placementStatusLabel.TextYAlignment = Enum.TextYAlignment.Center
+applyCorner(placementStatusLabel, 5)
+applyStroke(placementStatusLabel)
+
+local mouse = plugin:GetMouse()
+
+local function setLibraryStatus(text, isError)
+	libraryStatusLabel.Text = text
+	libraryStatusLabel.TextColor3 = isError and Color3.fromRGB(255, 166, 158) or COLORS.muted
+	libraryStatusLabel.BackgroundColor3 = isError and Color3.fromRGB(72, 42, 42) or COLORS.panel
+end
+
+local function setPlacementStatus(text, isError)
+	placementStatusLabel.Text = text
+	placementStatusLabel.TextColor3 = isError and Color3.fromRGB(255, 166, 158) or COLORS.muted
+	placementStatusLabel.BackgroundColor3 = isError and Color3.fromRGB(72, 42, 42) or COLORS.panel
+end
+
+local function beginRecording(name, displayName)
+	local ok, recording = pcall(function()
+		return ChangeHistoryService:TryBeginRecording(name, displayName)
+	end)
+	if ok then
+		return recording
+	end
+	return nil
+end
+
+local function finishRecording(recording, commit)
+	if not recording then
+		return
+	end
+	pcall(function()
+		ChangeHistoryService:FinishRecording(
+			recording,
+			commit and Enum.FinishRecordingOperation.Commit or Enum.FinishRecordingOperation.Cancel
+		)
+	end)
+end
+
+local function libraryRoot()
+	local root = ServerStorage:FindFirstChild(LIBRARY_NAME)
+	if not root then
+		root = Instance.new("Folder")
+		root.Name = LIBRARY_NAME
+		root.Parent = ServerStorage
+	end
+	local defaultPalette = root:FindFirstChild(DEFAULT_PALETTE_NAME)
+	if not defaultPalette then
+		defaultPalette = Instance.new("Folder")
+		defaultPalette.Name = DEFAULT_PALETTE_NAME
+		defaultPalette.Parent = root
+	end
+	return root
+end
+
+local function paletteFolders()
+	local folders = {}
+	for _, child in ipairs(libraryRoot():GetChildren()) do
+		if child:IsA("Folder") then
+			table.insert(folders, child)
+		end
+	end
+	table.sort(folders, function(a, b)
+		return string.lower(a.Name) < string.lower(b.Name)
+	end)
+	return folders
+end
+
+local function currentPalette()
+	local root = libraryRoot()
+	local palette = root:FindFirstChild(currentPaletteName)
+	if palette and palette:IsA("Folder") then
+		return palette
+	end
+	local folders = paletteFolders()
+	local fallback = folders[1]
+	currentPaletteName = fallback.Name
+	return fallback
+end
+
+local function isPlaceableAsset(instance)
+	if instance:IsA("BasePart") then
+		return true
+	end
+	if instance:IsA("Model") then
+		return instance:FindFirstChildWhichIsA("BasePart", true) ~= nil
+	end
+	return false
+end
+
+local function getBounds(instance)
+	if instance:IsA("Model") then
+		return instance:GetBoundingBox()
+	end
+	if instance:IsA("BasePart") then
+		return instance.CFrame, instance.Size
+	end
+	return CFrame.new(), Vector3.one
+end
+
+local function getPivot(instance)
+	if instance:IsA("PVInstance") then
+		return instance:GetPivot()
+	end
+	return CFrame.new()
+end
+
+local function pivotTo(instance, cframe)
+	if instance:IsA("PVInstance") then
+		instance:PivotTo(cframe)
+	end
+end
+
+local function forEachPart(instance, callback)
+	if instance:IsA("BasePart") then
+		callback(instance)
+	end
+	for _, descendant in ipairs(instance:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			callback(descendant)
+		end
+	end
+end
+
+local function scaleInstance(instance, scale)
+	scale = math.max(0.05, scale)
+	if instance:IsA("Model") then
+		instance:ScaleTo(instance:GetScale() * scale)
+	elseif instance:IsA("BasePart") then
+		instance.Size *= scale
+	end
+end
+
+local function defaultPlacementPivot(instance)
+	local boundsCFrame, boundsSize = getBounds(instance)
+	local modelPivot = getPivot(instance)
+	local bottomPosition = boundsCFrame.Position - boundsCFrame.UpVector * (boundsSize.Y * 0.5)
+	local bottomWorld = CFrame.new(bottomPosition) * modelPivot.Rotation
+	return modelPivot:ToObjectSpace(bottomWorld)
+end
+
+local function placementPivot(instance)
+	local value = instance:GetAttribute(PIVOT_ATTRIBUTE)
+	if typeof(value) == "CFrame" then
+		return value
+	end
+	return defaultPlacementPivot(instance)
+end
+
+local function scaledPlacementPivot(instance, scale)
+	local localPivot = placementPivot(instance)
+	return CFrame.new(localPivot.Position * scale) * localPivot.Rotation
+end
+
+local function uniqueName(parent, desired)
+	if not parent:FindFirstChild(desired) then
+		return desired
+	end
+	local index = 2
+	while parent:FindFirstChild(desired .. "_" .. tostring(index)) do
+		index += 1
+	end
+	return desired .. "_" .. tostring(index)
+end
+
+local function assetId(asset)
+	local id = asset:GetAttribute(ASSET_ID_ATTRIBUTE)
+	if type(id) ~= "string" or id == "" then
+		id = HttpService:GenerateGUID(false)
+		asset:SetAttribute(ASSET_ID_ATTRIBUTE, id)
+	end
+	return id
+end
+
+local function assetPaletteName(asset)
+	local parent = asset and asset.Parent
+	if parent and parent:IsA("Folder") and parent.Parent == libraryRoot() then
+		return parent.Name
+	end
+	return currentPaletteName
+end
+
+local function outputRoot()
+	local root = Workspace:FindFirstChild(OUTPUT_NAME)
+	if not root then
+		root = Instance.new("Folder")
+		root.Name = OUTPUT_NAME
+		root.Parent = Workspace
+	end
+	return root
+end
+
+local function outputFolderFor(asset)
+	local root = outputRoot()
+	local paletteName = assetPaletteName(asset)
+	local paletteFolder = root:FindFirstChild(paletteName)
+	if not paletteFolder then
+		paletteFolder = Instance.new("Folder")
+		paletteFolder.Name = paletteName
+		paletteFolder.Parent = root
+	end
+	local propFolder = paletteFolder:FindFirstChild(asset.Name)
+	if not propFolder then
+		propFolder = Instance.new("Folder")
+		propFolder.Name = asset.Name
+		propFolder.Parent = paletteFolder
+	end
+	return propFolder
+end
+
+settings.refreshManagement = function()
+	for _, child in ipairs(settings.managementList:GetChildren()) do
+		if child:IsA("GuiButton") then
+			child:Destroy()
+		end
+	end
+
+	local groups = {}
+	local generated = {}
+	local existingOutput = Workspace:FindFirstChild(OUTPUT_NAME)
+	if existingOutput then
+		for _, descendant in ipairs(existingOutput:GetDescendants()) do
+			if descendant:GetAttribute(GENERATED_ATTRIBUTE) == true then
+				table.insert(generated, descendant)
+				local paletteName = descendant:GetAttribute("PropPainterPalette") or "未分類"
+				local assetName = descendant:GetAttribute("PropPainterAssetName") or descendant.Name
+				local key = tostring(paletteName) .. " / " .. tostring(assetName)
+				if not groups[key] then
+					groups[key] = {
+						key = key,
+						instances = {},
+					}
+				end
+				table.insert(groups[key].instances, descendant)
+			end
+		end
+	end
+
+	local orderedGroups = {}
+	for _, group in pairs(groups) do
+		table.insert(orderedGroups, group)
+	end
+	table.sort(orderedGroups, function(a, b)
+		return string.lower(a.key) < string.lower(b.key)
+	end)
+
+	for index, group in ipairs(orderedGroups) do
+		local button = makeButton(
+			settings.managementList,
+			string.format("%s　× %d", group.key, #group.instances),
+			40,
+			false
+		)
+		button.LayoutOrder = index
+		button.TextXAlignment = Enum.TextXAlignment.Left
+		button.Activated:Connect(function()
+			Selection:Set(group.instances)
+			settings.managementStatus.Text = string.format("%s を%d個選択しました", group.key, #group.instances)
+		end)
+	end
+
+	settings.managementGenerated = generated
+	settings.managementSummary.Text = #generated == 0
+			and "生成済みプロップはありません"
+		or string.format("合計 %d個　／　%d種類", #generated, #orderedGroups)
+	settings.managementStatus.Text = #generated == 0
+			and "配置すると、この一覧へ自動的に分類されます"
+		or "種類をクリックするとStudio上でまとめて選択できます"
+end
+
+local function assetWeight(asset)
+	local weight = asset and asset:GetAttribute("PropPainterWeight")
+	if type(weight) ~= "number" then
+		weight = 1
+		if asset then
+			asset:SetAttribute("PropPainterWeight", weight)
+		end
+	end
+	local clamped = math.clamp(weight, 0, 2)
+	if asset and clamped ~= weight then
+		asset:SetAttribute("PropPainterWeight", clamped)
+	end
+	return clamped
+end
+
+local function selectedAssetList()
+	local assets = {}
+	for asset in pairs(selectedAssets) do
+		if asset.Parent and asset.Parent == currentPalette() and isPlaceableAsset(asset) then
+			table.insert(assets, asset)
+		else
+			selectedAssets[asset] = nil
+		end
+	end
+	if #assets == 0 and selectedAsset and selectedAsset.Parent == currentPalette() then
+		selectedAssets[selectedAsset] = true
+		table.insert(assets, selectedAsset)
+	end
+	table.sort(assets, function(a, b)
+		return string.lower(a.Name) < string.lower(b.Name)
+	end)
+	return assets
+end
+
+local function selectOnlyAsset(asset)
+	table.clear(selectedAssets)
+	if asset then
+		selectedAssets[asset] = true
+	end
+	selectedAsset = asset
+end
+
+local function chooseWeightedAsset(rng)
+	local assets = selectedAssetList()
+	if #assets == 0 then
+		return nil
+	end
+	local totalWeight = 0
+	for _, asset in ipairs(assets) do
+		totalWeight += assetWeight(asset)
+	end
+	if totalWeight <= 0 then
+		return nil
+	end
+	local target = rng:NextNumber(0, totalWeight)
+	local cumulative = 0
+	local lastPositive
+	for _, asset in ipairs(assets) do
+		local weight = assetWeight(asset)
+		if weight > 0 then
+			lastPositive = asset
+		end
+		cumulative += weight
+		if weight > 0 and target < cumulative then
+			return asset
+		end
+	end
+	return lastPositive
+end
+
+local function assetForSeed(seed)
+	return chooseWeightedAsset(Random.new(seed))
+end
+
+local function roundToStep(value, step)
+	if not step or step <= 0 then
+		return value
+	end
+	return math.floor(value / step + 0.5) * step
+end
+
+local function formatNumericValue(definition, value)
+	return string.format("%." .. tostring(definition.digits or 2) .. "f", value)
+end
+
+local function updateNumericSliderVisual(key)
+	local definition = NUMERIC_BY_KEY[key]
+	local controls = numericControls[key]
+	if not definition or not controls then
+		return
+	end
+	local value = tonumber(controls.field.Text) or definition.min
+	local normalized = math.clamp(
+		(value - definition.min) / (definition.max - definition.min),
+		0,
+		1
+	)
+	local ratio = normalized ^ (1 / (definition.curve or 1))
+	controls.fill.Size = UDim2.new(ratio, 0, 1, 0)
+	controls.knob.Position = UDim2.new(ratio, 0, 0.5, 0)
+end
+
+local function updateAllNumericSliderVisuals()
+	for _, definition in ipairs(NUMERIC_DEFINITIONS) do
+		updateNumericSliderVisual(definition.key)
+	end
+end
+
+settings.syncFieldsFromSettings = function()
+	scaleMinField.Text = string.format("%.2f", settings.scaleMin)
+	scaleMaxField.Text = string.format("%.2f", settings.scaleMax)
+	yawMinField.Text = string.format("%.0f", settings.yawMin)
+	yawMaxField.Text = string.format("%.0f", settings.yawMax)
+	countField.Text = tostring(settings.count)
+	brushRadiusField.Text = string.format("%.2f", settings.brushRadius)
+	brushDensityField.Text = tostring(settings.brushDensity)
+	minSpacingField.Text = string.format("%.2f", settings.minSpacing)
+	numericControls.rotationSnapAngle.field.Text = tostring(settings.rotationSnapAngle)
+	updateAllNumericSliderVisuals()
+end
+
+local function readSettings()
+	local scaleMin = tonumber(scaleMinField.Text) or settings.scaleMin
+	local scaleMax = tonumber(scaleMaxField.Text) or settings.scaleMax
+	local yawMin = tonumber(yawMinField.Text) or settings.yawMin
+	local yawMax = tonumber(yawMaxField.Text) or settings.yawMax
+	local count = tonumber(countField.Text) or settings.count
+	local weight = tonumber(weightField.Text)
+	local brushRadius = tonumber(brushRadiusField.Text) or settings.brushRadius
+	local brushDensity = tonumber(brushDensityField.Text) or settings.brushDensity
+	local minSpacing = tonumber(minSpacingField.Text) or settings.minSpacing
+	settings.scaleMin = math.clamp(math.min(scaleMin, scaleMax), 0.05, 20)
+	settings.scaleMax = math.clamp(math.max(scaleMin, scaleMax), 0.05, 20)
+	settings.yawMin = math.clamp(math.min(yawMin, yawMax), -3600, 3600)
+	settings.yawMax = math.clamp(math.max(yawMin, yawMax), -3600, 3600)
+	settings.count = math.clamp(math.floor(count + 0.5), 1, 1000)
+	settings.brushRadius = math.clamp(brushRadius, 0.5, 500)
+	settings.brushDensity = math.clamp(math.floor(brushDensity + 0.5), 1, 200)
+	settings.minSpacing = math.clamp(minSpacing, 0, 500)
+	settings.rotationSnapAngle = math.clamp(
+		math.floor((tonumber(numericControls.rotationSnapAngle.field.Text) or settings.rotationSnapAngle) + 0.5),
+		1,
+		180
+	)
+	if selectedAsset and selectedAsset.Parent and weight then
+		selectedAsset:SetAttribute("PropPainterWeight", math.clamp(weight, 0, 2))
+	end
+	scaleMinField.Text = string.format("%.2f", settings.scaleMin)
+	scaleMaxField.Text = string.format("%.2f", settings.scaleMax)
+	yawMinField.Text = string.format("%.0f", settings.yawMin)
+	yawMaxField.Text = string.format("%.0f", settings.yawMax)
+	countField.Text = tostring(settings.count)
+	weightField.Text = selectedAsset and string.format("%.2f", assetWeight(selectedAsset)) or "1.00"
+	brushRadiusField.Text = string.format("%.2f", settings.brushRadius)
+	brushDensityField.Text = tostring(settings.brushDensity)
+	minSpacingField.Text = string.format("%.2f", settings.minSpacing)
+	numericControls.rotationSnapAngle.field.Text = tostring(settings.rotationSnapAngle)
+	updateAllNumericSliderVisuals()
+	settings.savePreferences()
+end
+
+local function randomTransform(seed, asset)
+	local rng = Random.new(seed)
+	local scaleMin = settings.scaleMin
+	local scaleMax = settings.scaleMax
+	local yawMin = settings.yawMin
+	local yawMax = settings.yawMax
+	if asset and asset:GetAttribute("PropPainterOverrideEnabled") == true then
+		scaleMin = asset:GetAttribute("PropPainterScaleMin") or scaleMin
+		scaleMax = asset:GetAttribute("PropPainterScaleMax") or scaleMax
+		yawMin = asset:GetAttribute("PropPainterYawMin") or yawMin
+		yawMax = asset:GetAttribute("PropPainterYawMax") or yawMax
+	end
+	scaleMin, scaleMax = math.min(scaleMin, scaleMax), math.max(scaleMin, scaleMax)
+	yawMin, yawMax = math.min(yawMin, yawMax), math.max(yawMin, yawMax)
+	local scale = rng:NextNumber(scaleMin, scaleMax)
+	local yaw = rng:NextNumber(yawMin, yawMax)
+	return scale, yaw
+end
+
+local function surfaceRotation(normal)
+	local up = Vector3.yAxis
+	local normalized = normal.Magnitude > 0 and normal.Unit or up
+	local axis = up:Cross(normalized)
+	if axis.Magnitude < 0.0001 then
+		if up:Dot(normalized) < 0 then
+			return CFrame.Angles(math.pi, 0, 0)
+		end
+		return CFrame.new()
+	end
+	local angle = math.acos(math.clamp(up:Dot(normalized), -1, 1))
+	return CFrame.fromAxisAngle(axis.Unit, angle)
+end
+
+local function targetPlacementCFrame(position, normal, yawDegrees, asset)
+	local alignToSurface = settings.alignToSurface
+	if asset and asset:GetAttribute("PropPainterOverrideEnabled") == true then
+		local overrideAlign = asset:GetAttribute("PropPainterAlignToSurface")
+		if type(overrideAlign) == "boolean" then
+			alignToSurface = overrideAlign
+		end
+	end
+	local rotation = alignToSurface and surfaceRotation(normal) or CFrame.new()
+	return CFrame.new(position) * rotation * CFrame.Angles(0, math.rad(yawDegrees), 0)
+end
+
+local function configurePlacedParts(instance)
+	forEachPart(instance, function(part)
+		part.Anchored = true
+	end)
+end
+
+local function createPlacedProp(asset, position, normal, seed, placementMode, yawOverride)
+	local scale, yaw = randomTransform(seed, asset)
+	if type(yawOverride) == "number" then
+		yaw = yawOverride
+	end
+	local clone = asset:Clone()
+	scaleInstance(clone, scale)
+	configurePlacedParts(clone)
+	local localPivot = scaledPlacementPivot(asset, scale)
+	local target = targetPlacementCFrame(position, normal, yaw, asset)
+	pivotTo(clone, target * localPivot:Inverse())
+	clone.Name = asset.Name
+	clone:SetAttribute(GENERATED_ATTRIBUTE, true)
+	clone:SetAttribute(ASSET_ID_ATTRIBUTE, assetId(asset))
+	clone:SetAttribute("PropPainterAssetName", asset.Name)
+	clone:SetAttribute("PropPainterPalette", assetPaletteName(asset))
+	clone:SetAttribute("PropPainterSeed", seed)
+	clone:SetAttribute("PropPainterScale", scale)
+	clone:SetAttribute("PropPainterYaw", yaw)
+	clone:SetAttribute("PropPainterMode", placementMode)
+	clone:SetAttribute("PropPainterVersion", VERSION)
+	clone:SetAttribute("PropPainterPosition", position)
+	clone:SetAttribute("PropPainterNormal", normal)
+	local appliedAlign = settings.alignToSurface
+	if asset:GetAttribute("PropPainterOverrideEnabled") == true then
+		local overrideAlign = asset:GetAttribute("PropPainterAlignToSurface")
+		if type(overrideAlign) == "boolean" then
+			appliedAlign = overrideAlign
+		end
+	end
+	clone:SetAttribute("PropPainterAlignToSurface", appliedAlign)
+	clone.Parent = outputFolderFor(asset)
+	return clone
+end
+
+settings.reapplyGeneratedSelection = function(randomize)
+	readSettings()
+	local existingOutput = Workspace:FindFirstChild(OUTPUT_NAME)
+	local targets = {}
+	if existingOutput then
+		for _, item in ipairs(Selection:Get()) do
+			if item.Parent
+				and item:IsDescendantOf(existingOutput)
+				and item:GetAttribute(GENERATED_ATTRIBUTE) == true
+			then
+				table.insert(targets, item)
+			end
+		end
+	end
+	if #targets == 0 then
+		settings.managementStatus.Text = "先に生成済みプロップを選択してください"
+		return
+	end
+
+	local recording = beginRecording(
+		"PropPainterReapplyGenerated",
+		randomize and "Prop Painter: 選択を再ランダム化" or "Prop Painter: 選択へ設定を再適用"
+	)
+	if not recording then
+		settings.managementStatus.Text = "Undo記録を開始できませんでした"
+		return
+	end
+
+	local replacements = {}
+	local missingAssets = 0
+	for _, item in ipairs(targets) do
+		local sourceAsset
+		local sourceId = item:GetAttribute(ASSET_ID_ATTRIBUTE)
+		local sourcePalette = item:GetAttribute("PropPainterPalette")
+		local sourceName = item:GetAttribute("PropPainterAssetName")
+		for _, palette in ipairs(libraryRoot():GetChildren()) do
+			if palette:IsA("Folder") then
+				for _, candidate in ipairs(palette:GetChildren()) do
+					if isPlaceableAsset(candidate)
+						and (
+							(type(sourceId) == "string"
+								and sourceId ~= ""
+								and candidate:GetAttribute(ASSET_ID_ATTRIBUTE) == sourceId)
+							or (palette.Name == sourcePalette and candidate.Name == sourceName)
+						)
+					then
+						sourceAsset = candidate
+						break
+					end
+				end
+			end
+			if sourceAsset then
+				break
+			end
+		end
+
+		if sourceAsset then
+			local oldScale = item:GetAttribute("PropPainterScale")
+			if type(oldScale) ~= "number" then
+				oldScale = 1
+			end
+			local position = item:GetAttribute("PropPainterPosition")
+			local normal = item:GetAttribute("PropPainterNormal")
+			local okTarget, currentTarget = pcall(function()
+				return getPivot(item) * scaledPlacementPivot(sourceAsset, oldScale)
+			end)
+			if okTarget then
+				position = currentTarget.Position
+				normal = currentTarget.UpVector
+			end
+			if typeof(position) ~= "Vector3" then
+				position = getPivot(item).Position
+			end
+			if typeof(normal) ~= "Vector3" or normal.Magnitude < 0.001 then
+				normal = Vector3.yAxis
+			else
+				normal = normal.Unit
+			end
+
+			local seed = item:GetAttribute("PropPainterSeed")
+			if randomize or type(seed) ~= "number" then
+				seed = randomSource:NextInteger(1, 2147483646)
+			end
+			local oldName = item.Name
+			local oldMode = item:GetAttribute("PropPainterMode") or "Reapply"
+			local okCreate, replacement = pcall(function()
+				return createPlacedProp(sourceAsset, position, normal, seed, oldMode)
+			end)
+			if okCreate and replacement then
+				replacement.Name = oldName
+				replacement:SetAttribute(
+					"PropPainterLastOperation",
+					randomize and "Rerandomize" or "Reapply"
+				)
+				item:Destroy()
+				table.insert(replacements, replacement)
+			end
+		else
+			missingAssets += 1
+		end
+	end
+
+	finishRecording(recording, #replacements > 0)
+	if #replacements > 0 then
+		Selection:Set(replacements)
+	end
+	settings.refreshManagement()
+	if missingAssets > 0 then
+		settings.managementStatus.Text = string.format(
+			"%d個を更新、%d個は元プロップが見つかりません",
+			#replacements,
+			missingAssets
+		)
+	else
+		settings.managementStatus.Text = string.format(
+			randomize and "%d個を再ランダム化しました" or "%d個へ現在の設定を再適用しました",
+			#replacements
+		)
+	end
+end
+
+local function topLevelValidSelection()
+	local selected = Selection:Get()
+	local selectedSet = {}
+	for _, item in ipairs(selected) do
+		selectedSet[item] = true
+	end
+	local valid = {}
+	for _, item in ipairs(selected) do
+		if isPlaceableAsset(item)
+			and not item:IsDescendantOf(libraryRoot())
+			and not item:IsDescendantOf(outputRoot())
+			and item.Name ~= TEMP_EDIT_NAME
+		then
+			local ancestorSelected = false
+			local ancestor = item.Parent
+			while ancestor do
+				if selectedSet[ancestor] then
+					ancestorSelected = true
+					break
+				end
+				ancestor = ancestor.Parent
+			end
+			if not ancestorSelected then
+				table.insert(valid, item)
+			end
+		end
+	end
+	return valid
+end
+
+local function addSelectionToLibrary()
+	if pivotSession then
+		setLibraryStatus("Pivot編集中は登録できません", true)
+		return
+	end
+	local sources = topLevelValidSelection()
+	if #sources == 0 then
+		setLibraryStatus("ModelまたはPartを選択してください", true)
+		return
+	end
+	local recording = beginRecording("PropPainterAddAssets", "Prop Painter: ライブラリへ追加")
+	if not recording then
+		setLibraryStatus("Undo記録を開始できませんでした", true)
+		return
+	end
+	local palette = currentPalette()
+	local added = {}
+	local ok, errorMessage = pcall(function()
+		for _, source in ipairs(sources) do
+			local clone = source:Clone()
+			clone.Name = uniqueName(palette, source.Name)
+			clone:SetAttribute(ASSET_ID_ATTRIBUTE, HttpService:GenerateGUID(false))
+			clone:SetAttribute(PIVOT_ATTRIBUTE, defaultPlacementPivot(clone))
+			clone.Parent = palette
+			table.insert(added, clone)
+		end
+	end)
+	finishRecording(recording, ok)
+	if not ok then
+		setLibraryStatus("登録に失敗しました: " .. tostring(errorMessage), true)
+		return
+	end
+	table.clear(selectedAssets)
+	for _, asset in ipairs(added) do
+		selectedAssets[asset] = true
+	end
+	selectedAsset = added[#added]
+	refreshLibrary()
+	setLibraryStatus(string.format("%d個のプロップを登録しました", #added))
+end
+
+local function clearAssetCards()
+	for _, cardData in pairs(libraryCards) do
+		if cardData.button then
+			cardData.button:Destroy()
+		end
+	end
+	table.clear(libraryCards)
+end
+
+settings.stopActivePropSlider = function()
+	settings.activeWeightDrag = nil
+	if settings.activeWeightList then
+		settings.activeWeightList.ScrollingEnabled = true
+	end
+end
+
+settings.handleActivePropSliderMovement = function(input)
+	local drag = settings.activeWeightDrag
+	if not drag then
+		return
+	end
+	if input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch
+	then
+		drag.apply(input.Position.X)
+	end
+end
+
+settings.refreshActiveWeights = function()
+	settings.stopActivePropSlider()
+	settings.activeWeightEditors = {}
+	for _, child in ipairs(settings.activeWeightList:GetChildren()) do
+		if child:IsA("GuiObject") then
+			child:Destroy()
+		end
+	end
+
+	local assets = selectedAssetList()
+	if #assets == 0 then
+		local emptyLabel = makeLabel(
+			settings.activeWeightList,
+			"プロップを選択すると個別設定が表示されます",
+			44,
+			10,
+			COLORS.muted
+		)
+		emptyLabel.TextXAlignment = Enum.TextXAlignment.Center
+		emptyLabel.TextYAlignment = Enum.TextYAlignment.Center
+		return
+	end
+
+	for index, asset in ipairs(assets) do
+		local overrideEnabled = asset:GetAttribute("PropPainterOverrideEnabled") == true
+		if asset:GetAttribute("PropPainterScaleMin") == nil then
+			asset:SetAttribute("PropPainterScaleMin", settings.scaleMin)
+		end
+		if asset:GetAttribute("PropPainterScaleMax") == nil then
+			asset:SetAttribute("PropPainterScaleMax", settings.scaleMax)
+		end
+		if asset:GetAttribute("PropPainterYawMin") == nil then
+			asset:SetAttribute("PropPainterYawMin", settings.yawMin)
+		end
+		if asset:GetAttribute("PropPainterYawMax") == nil then
+			asset:SetAttribute("PropPainterYawMax", settings.yawMax)
+		end
+		if asset:GetAttribute("PropPainterAlignToSurface") == nil then
+			asset:SetAttribute("PropPainterAlignToSurface", settings.alignToSurface)
+		end
+
+		local row = Instance.new("Frame")
+		row.Name = "Weight_" .. asset.Name
+		row.BackgroundColor3 = COLORS.background
+		row.BorderSizePixel = 0
+		row.Size = UDim2.new(1, 0, 0, overrideEnabled and 292 or 88)
+		row.LayoutOrder = index
+		row.Parent = settings.activeWeightList
+		applyCorner(row, 4)
+
+		local nameLabel = makeLabel(row, asset.Name, 23, 10, COLORS.text)
+		nameLabel.Position = UDim2.fromOffset(7, 1)
+		nameLabel.Size = UDim2.new(1, -112, 0, 23)
+		nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+		local overrideButton = makeButton(row, "", 23, false)
+		overrideButton.AnchorPoint = Vector2.new(1, 0)
+		overrideButton.Position = UDim2.new(1, -5, 0, 2)
+		overrideButton.Size = UDim2.fromOffset(98, 23)
+		overrideButton.TextSize = scaledTextSize(10)
+
+		local weightLabel = makeLabel(row, "生成重み", 19, 9, COLORS.muted)
+		weightLabel.Position = UDim2.fromOffset(7, 26)
+		weightLabel.Size = UDim2.new(1, -86, 0, 19)
+
+		local valueInput = Instance.new("TextBox")
+		valueInput.Name = "WeightValue"
+		valueInput.AnchorPoint = Vector2.new(1, 0)
+		valueInput.BackgroundColor3 = COLORS.field
+		valueInput.ClearTextOnFocus = false
+		valueInput.Position = UDim2.new(1, -6, 0, 26)
+		valueInput.Size = UDim2.fromOffset(70, 20)
+		valueInput.Font = Enum.Font.GothamMedium
+		valueInput.TextColor3 = COLORS.text
+		valueInput.TextSize = scaledTextSize(10)
+		valueInput.TextXAlignment = Enum.TextXAlignment.Center
+		valueInput.Parent = row
+		applyCorner(valueInput, 4)
+
+		local slider = Instance.new("TextButton")
+		slider.Name = "WeightSlider"
+		slider.Active = true
+		slider.AutoButtonColor = false
+		slider.BackgroundTransparency = 1
+		slider.Position = UDim2.fromOffset(7, 50)
+		slider.Size = UDim2.new(1, -14, 0, 24)
+		slider.Text = ""
+		slider.Parent = row
+
+		local track = Instance.new("Frame")
+		track.AnchorPoint = Vector2.new(0, 0.5)
+		track.BackgroundColor3 = COLORS.field
+		track.BorderSizePixel = 0
+		track.Position = UDim2.new(0, 0, 0.5, 0)
+		track.Size = UDim2.new(1, 0, 0, 6)
+		track.Parent = slider
+		applyCorner(track, 4)
+
+		local fill = Instance.new("Frame")
+		fill.BackgroundColor3 = COLORS.accent
+		fill.BorderSizePixel = 0
+		fill.Size = UDim2.new(0, 0, 1, 0)
+		fill.Parent = track
+		applyCorner(fill, 4)
+
+		local knob = Instance.new("Frame")
+		knob.AnchorPoint = Vector2.new(0.5, 0.5)
+		knob.BackgroundColor3 = COLORS.text
+		knob.BorderSizePixel = 0
+		knob.Position = UDim2.new(0, 0, 0.5, 0)
+		knob.Size = UDim2.fromOffset(13, 13)
+		knob.Parent = track
+		applyCorner(knob, 7)
+
+		local function renderWeight(value)
+			value = math.clamp(value, 0, 2)
+			asset:SetAttribute("PropPainterWeight", value)
+			valueInput.Text = string.format("%.2f", value)
+			local ratio = value / 2
+			fill.Size = UDim2.new(ratio, 0, 1, 0)
+			knob.Position = UDim2.new(ratio, 0, 0.5, 0)
+			local cardData = libraryCards[asset]
+			if cardData and cardData.weightInput and not cardData.weightInput:IsFocused() then
+				cardData.weightInput.Text = valueInput.Text
+			end
+			if selectedAsset == asset then
+				weightField.Text = valueInput.Text
+				updateNumericSliderVisual("weight")
+			end
+		end
+
+		local function applyFromPointer(pointerX)
+			local width = slider.AbsoluteSize.X
+			if width <= 0 then
+				return
+			end
+			local ratio = math.clamp((pointerX - slider.AbsolutePosition.X) / width, 0, 1)
+			renderWeight(ratio * 2)
+		end
+
+		local details = Instance.new("Frame")
+		details.Name = "OverrideDetails"
+		details.BackgroundTransparency = 1
+		details.Position = UDim2.fromOffset(0, 82)
+		details.Size = UDim2.new(1, 0, 0, 204)
+		details.Visible = overrideEnabled
+		details.Parent = row
+
+		settings.activeWeightEditors[asset] = {
+			render = renderWeight,
+			valueInput = valueInput,
+			slider = slider,
+			fill = fill,
+			knob = knob,
+			overrides = {},
+		}
+		renderWeight(assetWeight(asset))
+		valueInput.FocusLost:Connect(function()
+			renderWeight(tonumber(valueInput.Text) or assetWeight(asset))
+		end)
+		valueInput.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton2 then
+				renderWeight(1)
+			end
+		end)
+		slider.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				settings.activeWeightDrag = {
+					input = input,
+					apply = applyFromPointer,
+				}
+				settings.activeWeightList.ScrollingEnabled = false
+				applyFromPointer(input.Position.X)
+				input:GetPropertyChangedSignal("UserInputState"):Connect(function()
+					if input.UserInputState == Enum.UserInputState.End then
+						settings.stopActivePropSlider()
+					end
+				end)
+			elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+				renderWeight(1)
+			end
+		end)
+		slider.InputChanged:Connect(settings.handleActivePropSliderMovement)
+		slider.MouseButton1Up:Connect(settings.stopActivePropSlider)
+		slider.MouseEnter:Connect(function()
+			knob.BackgroundColor3 = COLORS.accentHover
+		end)
+		slider.MouseLeave:Connect(function()
+			if not settings.activeWeightDrag or settings.activeWeightDrag.input.UserInputState == Enum.UserInputState.End then
+				knob.BackgroundColor3 = COLORS.text
+			end
+		end)
+
+		local function makeOverrideSlider(key, labelText, minimum, maximum, curve, digits, y)
+			local attributeName = "PropPainter" .. key
+			local label = makeLabel(details, labelText, 18, 9, COLORS.muted)
+			label.Position = UDim2.fromOffset(7, y)
+			label.Size = UDim2.new(1, -84, 0, 18)
+
+			local field = Instance.new("TextBox")
+			field.AnchorPoint = Vector2.new(1, 0)
+			field.BackgroundColor3 = COLORS.field
+			field.ClearTextOnFocus = false
+			field.Position = UDim2.new(1, -6, 0, y)
+			field.Size = UDim2.fromOffset(70, 19)
+			field.Font = Enum.Font.GothamMedium
+			field.TextColor3 = COLORS.text
+			field.TextSize = scaledTextSize(9)
+			field.TextXAlignment = Enum.TextXAlignment.Center
+			field.Parent = details
+			applyCorner(field, 4)
+
+			local control = Instance.new("TextButton")
+			control.Active = true
+			control.AutoButtonColor = false
+			control.BackgroundTransparency = 1
+			control.Position = UDim2.fromOffset(7, y + 18)
+			control.Size = UDim2.new(1, -14, 0, 22)
+			control.Text = ""
+			control.Parent = details
+
+			local controlTrack = Instance.new("Frame")
+			controlTrack.AnchorPoint = Vector2.new(0, 0.5)
+			controlTrack.BackgroundColor3 = COLORS.field
+			controlTrack.BorderSizePixel = 0
+			controlTrack.Position = UDim2.new(0, 0, 0.5, 0)
+			controlTrack.Size = UDim2.new(1, 0, 0, 5)
+			controlTrack.Parent = control
+			applyCorner(controlTrack, 3)
+
+			local controlFill = Instance.new("Frame")
+			controlFill.BackgroundColor3 = COLORS.accent
+			controlFill.BorderSizePixel = 0
+			controlFill.Parent = controlTrack
+			applyCorner(controlFill, 3)
+
+			local controlKnob = Instance.new("Frame")
+			controlKnob.AnchorPoint = Vector2.new(0.5, 0.5)
+			controlKnob.BackgroundColor3 = COLORS.text
+			controlKnob.BorderSizePixel = 0
+			controlKnob.Size = UDim2.fromOffset(12, 12)
+			controlKnob.Parent = controlTrack
+			applyCorner(controlKnob, 6)
+
+			local function render(value)
+				value = math.clamp(value, minimum, maximum)
+				asset:SetAttribute(attributeName, value)
+				field.Text = string.format("%." .. tostring(digits) .. "f", value)
+				local normalized = math.clamp((value - minimum) / (maximum - minimum), 0, 1)
+				local ratio = normalized ^ (1 / curve)
+				controlFill.Size = UDim2.new(ratio, 0, 1, 0)
+				controlKnob.Position = UDim2.new(ratio, 0, 0.5, 0)
+			end
+
+			local function applyPointer(pointerX)
+				local width = control.AbsoluteSize.X
+				if width <= 0 then
+					return
+				end
+				local ratio = math.clamp((pointerX - control.AbsolutePosition.X) / width, 0, 1)
+				render(minimum + (maximum - minimum) * ratio ^ curve)
+			end
+
+			render(asset:GetAttribute(attributeName) or 0)
+			field.FocusLost:Connect(function()
+				render(tonumber(field.Text) or asset:GetAttribute(attributeName) or 0)
+			end)
+			field.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton2 then
+					local globalKey = key:sub(1, 1):lower() .. key:sub(2)
+					render(settings[globalKey] or 0)
+				end
+			end)
+			control.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 then
+					settings.activeWeightDrag = {
+						input = input,
+						apply = applyPointer,
+					}
+					settings.activeWeightList.ScrollingEnabled = false
+					applyPointer(input.Position.X)
+					input:GetPropertyChangedSignal("UserInputState"):Connect(function()
+						if input.UserInputState == Enum.UserInputState.End then
+							settings.stopActivePropSlider()
+						end
+					end)
+				elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+					local globalKey = key:sub(1, 1):lower() .. key:sub(2)
+					render(settings[globalKey] or 0)
+				end
+			end)
+			control.InputChanged:Connect(settings.handleActivePropSliderMovement)
+			control.MouseButton1Up:Connect(settings.stopActivePropSlider)
+			settings.activeWeightEditors[asset].overrides[key] = {
+				render = render,
+				field = field,
+				slider = control,
+			}
+		end
+
+		makeOverrideSlider("ScaleMin", "サイズ 最小", 0.05, 20, 2, 2, 0)
+		makeOverrideSlider("ScaleMax", "サイズ 最大", 0.05, 20, 2, 2, 42)
+		makeOverrideSlider("YawMin", "Y回転 最小", -360, 360, 1, 0, 84)
+		makeOverrideSlider("YawMax", "Y回転 最大", -360, 360, 1, 0, 126)
+
+		local alignButton = makeButton(details, "", 27, false)
+		alignButton.Position = UDim2.fromOffset(7, 169)
+		alignButton.Size = UDim2.new(1, -14, 0, 27)
+		alignButton.TextSize = scaledTextSize(10)
+		local function renderAlign()
+			local align = asset:GetAttribute("PropPainterAlignToSurface") == true
+			alignButton.Text = align and "面に沿わせる: ON" or "面に沿わせる: OFF"
+			alignButton.BackgroundColor3 = align and COLORS.accent or COLORS.panel
+		end
+		alignButton.Activated:Connect(function()
+			asset:SetAttribute(
+				"PropPainterAlignToSurface",
+				not (asset:GetAttribute("PropPainterAlignToSurface") == true)
+			)
+			renderAlign()
+		end)
+		renderAlign()
+
+		local function renderOverrideState()
+			overrideEnabled = asset:GetAttribute("PropPainterOverrideEnabled") == true
+			overrideButton.Text = overrideEnabled and "個別設定: ON" or "個別設定: OFF"
+			overrideButton.BackgroundColor3 = overrideEnabled and COLORS.accent or COLORS.panel
+			details.Visible = overrideEnabled
+			row.Size = UDim2.new(1, 0, 0, overrideEnabled and 292 or 88)
+		end
+		overrideButton.Activated:Connect(function()
+			asset:SetAttribute("PropPainterOverrideEnabled", not overrideEnabled)
+			renderOverrideState()
+		end)
+		renderOverrideState()
+	end
+end
+
+local function updateCardHighlights()
+	for asset, cardData in pairs(libraryCards) do
+		local isSelected = selectedAssets[asset] == true
+		local isPrimary = asset == selectedAsset
+		cardData.button.BackgroundColor3 = isSelected and COLORS.accent or COLORS.panel
+		if cardData.stroke then
+			cardData.stroke.Color = isPrimary and Color3.fromRGB(126, 206, 255)
+				or (isSelected and COLORS.accentHover or COLORS.border)
+			cardData.stroke.Thickness = isPrimary and 3 or (isSelected and 2 or 1)
+		end
+		if cardData.toggle then
+			cardData.toggle.Text = isSelected and "✓" or "+"
+			cardData.toggle.BackgroundColor3 = isSelected and COLORS.accent or COLORS.field
+		end
+		if cardData.weightInput and not cardData.weightInput:IsFocused() then
+			cardData.weightInput.Text = string.format("%.2f", assetWeight(asset))
+		end
+	end
+end
+
+local function applyAssetSelection(asset, additive)
+	if additive then
+		if selectedAssets[asset] then
+			selectedAssets[asset] = nil
+			if selectedAsset == asset then
+				selectedAsset = next(selectedAssets)
+			end
+		else
+			selectedAssets[asset] = true
+			selectedAsset = asset
+		end
+	else
+		selectOnlyAsset(asset)
+	end
+	updateSelectedAssetUI()
+	updateCardHighlights()
+end
+
+local function makeAssetCard(asset)
+	local button = Instance.new("TextButton")
+	button.Name = asset.Name
+	button.AutoButtonColor = false
+	button.BackgroundColor3 = COLORS.panel
+	button.Text = ""
+	button.Parent = assetGrid
+	applyCorner(button, 5)
+	applyStroke(button)
+	local stroke = button:FindFirstChildWhichIsA("UIStroke")
+
+	local viewport = Instance.new("ViewportFrame")
+	viewport.BackgroundColor3 = COLORS.field
+	viewport.BorderSizePixel = 0
+	viewport.Position = UDim2.fromOffset(5, 5)
+	viewport.Size = UDim2.new(1, -10, 1, -31)
+	viewport.Ambient = Color3.fromRGB(170, 170, 170)
+	viewport.LightColor = Color3.fromRGB(255, 255, 255)
+	viewport.LightDirection = Vector3.new(-1, -1, -1)
+	viewport.Parent = button
+	applyCorner(viewport, 4)
+
+	local worldModel = Instance.new("WorldModel")
+	worldModel.Parent = viewport
+	local displayClone = asset:Clone()
+	forEachPart(displayClone, function(part)
+		part.Anchored = true
+	end)
+	displayClone.Parent = worldModel
+
+	local boundsCFrame, boundsSize = getBounds(displayClone)
+	local maxDimension = math.max(boundsSize.X, boundsSize.Y, boundsSize.Z, 0.5)
+	local camera = Instance.new("Camera")
+	camera.FieldOfView = 35
+	camera.CFrame = CFrame.lookAt(
+		boundsCFrame.Position + Vector3.new(1.25, 0.9, 1.25).Unit * (maxDimension * 2.4),
+		boundsCFrame.Position
+	)
+	camera.Parent = viewport
+	viewport.CurrentCamera = camera
+
+	local nameLabel = makeLabel(button, asset.Name, 24, 11)
+	nameLabel.AnchorPoint = Vector2.new(0, 1)
+	nameLabel.Position = UDim2.new(0, 6, 1, -1)
+	nameLabel.Size = UDim2.new(1, -12, 0, 24)
+	nameLabel.TextXAlignment = Enum.TextXAlignment.Center
+	nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+	local selectionToggle = Instance.new("TextButton")
+	selectionToggle.Name = "MultiSelectToggle"
+	selectionToggle.AnchorPoint = Vector2.new(1, 0)
+	selectionToggle.Position = UDim2.new(1, -7, 0, 7)
+	selectionToggle.Size = UDim2.fromOffset(26, 26)
+	selectionToggle.AutoButtonColor = false
+	selectionToggle.BackgroundColor3 = COLORS.field
+	selectionToggle.Font = Enum.Font.GothamBold
+	selectionToggle.Text = "+"
+	selectionToggle.TextColor3 = COLORS.text
+	selectionToggle.TextSize = scaledTextSize(17)
+	selectionToggle.ZIndex = 20
+	selectionToggle.Parent = button
+	applyCorner(selectionToggle, 5)
+	applyStroke(selectionToggle)
+	selectionToggle.Activated:Connect(function()
+		if pivotSession then
+			setLibraryStatus("先にPivot編集を終了してください", true)
+			return
+		end
+		applyAssetSelection(asset, true)
+	end)
+	selectionToggle.MouseEnter:Connect(function()
+		selectionToggle.BackgroundColor3 = COLORS.accentHover
+	end)
+	selectionToggle.MouseLeave:Connect(function()
+		selectionToggle.BackgroundColor3 = selectedAssets[asset] and COLORS.accent or COLORS.field
+	end)
+
+	local weightLabel = makeLabel(button, "重み", 24, 10, COLORS.muted)
+	weightLabel.Position = UDim2.fromOffset(8, 8)
+	weightLabel.Size = UDim2.fromOffset(30, 24)
+	weightLabel.ZIndex = 20
+
+	local weightInput = Instance.new("TextBox")
+	weightInput.Name = "WeightInput"
+	weightInput.BackgroundColor3 = COLORS.field
+	weightInput.ClearTextOnFocus = false
+	weightInput.Position = UDim2.fromOffset(38, 8)
+	weightInput.Size = UDim2.fromOffset(52, 24)
+	weightInput.Font = Enum.Font.GothamMedium
+	weightInput.Text = string.format("%.2f", assetWeight(asset))
+	weightInput.TextColor3 = COLORS.text
+	weightInput.TextSize = scaledTextSize(11)
+	weightInput.TextXAlignment = Enum.TextXAlignment.Center
+	weightInput.ZIndex = 20
+	weightInput.Parent = button
+	applyCorner(weightInput, 5)
+	applyStroke(weightInput)
+
+	local function applyCardWeight(value)
+		if type(value) ~= "number" then
+			value = assetWeight(asset)
+		end
+		value = math.clamp(value, 0, 2)
+		asset:SetAttribute("PropPainterWeight", value)
+		weightInput.Text = string.format("%.2f", value)
+		if selectedAsset == asset then
+			weightField.Text = weightInput.Text
+			updateNumericSliderVisual("weight")
+		end
+		if settings.refreshActiveWeights then
+			settings.refreshActiveWeights()
+		end
+		setLibraryStatus(string.format("%s の重み: %.2f", asset.Name, value))
+	end
+
+	weightInput.FocusLost:Connect(function()
+		applyCardWeight(tonumber(weightInput.Text))
+	end)
+	weightInput.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton2 then
+			applyCardWeight(1)
+		end
+	end)
+
+	local additiveSelectionAtPress = false
+	button.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			additiveSelectionAtPress = multiSelectMode
+				or settings.selectionControl
+				or settings.selectionShift
+				or UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+				or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+				or UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+				or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+		end
+	end)
+	button.Activated:Connect(function()
+		if pivotSession then
+			setLibraryStatus("先にPivot編集を終了してください", true)
+			return
+		end
+		local additive = additiveSelectionAtPress
+			or multiSelectMode
+			or settings.selectionControl
+			or settings.selectionShift
+			or UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+			or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+			or UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+			or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+		additiveSelectionAtPress = false
+		applyAssetSelection(asset, additive)
+	end)
+	button.MouseEnter:Connect(function()
+		if selectedAsset ~= asset then
+			button.BackgroundColor3 = COLORS.panelHover
+		end
+	end)
+	button.MouseLeave:Connect(function()
+		button.BackgroundColor3 = selectedAssets[asset] and COLORS.accent or COLORS.panel
+	end)
+
+	libraryCards[asset] = {
+		button = button,
+		stroke = stroke,
+		toggle = selectionToggle,
+		weightInput = weightInput,
+		applyWeight = applyCardWeight,
+	}
+end
+
+refreshLibrary = function()
+	local palette = currentPalette()
+	paletteButton.Text = "パレット: " .. palette.Name .. "  ▶"
+	if selectedAsset and (not selectedAsset.Parent or selectedAsset.Parent ~= palette) then
+		selectOnlyAsset(nil)
+	end
+	clearAssetCards()
+	local assets = {}
+	for _, child in ipairs(palette:GetChildren()) do
+		if isPlaceableAsset(child) then
+			table.insert(assets, child)
+			assetId(child)
+			assetWeight(child)
+		end
+	end
+	table.sort(assets, function(a, b)
+		return string.lower(a.Name) < string.lower(b.Name)
+	end)
+	if #selectedAssetList() == 0 and #assets > 0 then
+		selectOnlyAsset(assets[1])
+	end
+	for _, asset in ipairs(assets) do
+		makeAssetCard(asset)
+	end
+	updateSelectedAssetUI()
+	updateCardHighlights()
+	if #assets == 0 then
+		setLibraryStatus("このパレットにはプロップがありません")
+	else
+		setLibraryStatus(string.format("%d個のプロップ", #assets))
+	end
+end
+
+updateSelectedAssetUI = function()
+	local assets = selectedAssetList()
+	if selectedAsset and selectedAsset.Parent and #assets > 0 then
+		librarySelectionLabel.Text = #assets == 1
+				and ("選択中: " .. selectedAsset.Name)
+			or string.format("%d個選択（主: %s）", #assets, selectedAsset.Name)
+		placementAssetLabel.Text = #assets == 1
+				and ("選択中: " .. assetPaletteName(selectedAsset) .. " / " .. selectedAsset.Name)
+			or string.format("選択中: %s / %d個（重み付き）", assetPaletteName(selectedAsset), #assets)
+		placementAssetLabel.TextColor3 = COLORS.text
+		weightField.Text = string.format("%.2f", assetWeight(selectedAsset))
+	else
+		selectOnlyAsset(nil)
+		librarySelectionLabel.Text = "プロップを選択してください"
+		placementAssetLabel.Text = "選択中: なし"
+		placementAssetLabel.TextColor3 = COLORS.muted
+		weightField.Text = "1.00"
+	end
+	updateNumericSliderVisual("weight")
+	alignButton.Text = settings.alignToSurface and "面に沿わせる: ON" or "面に沿わせる: OFF（垂直維持）"
+	settings.rotationSnapButton.Text = settings.singleRotationSnapEnabled
+			and ("単体回転スナップ: ON（" .. tostring(settings.rotationSnapAngle) .. "°）")
+		or "単体回転スナップ: OFF"
+	settings.rotationSnapButton.BackgroundColor3 = settings.singleRotationSnapEnabled and COLORS.accent or COLORS.panel
+	surfaceModeButton.Text = settings.batchSurfaceMode == "Top"
+			and "一括生成の対象面: 上面のみ"
+		or "一括生成の対象面: 全表面"
+	densityModeButton.Text = settings.densityMode == "Maintain"
+			and "ペイント方式: 密度維持"
+		or "ペイント方式: 追加"
+	spacingButton.Text = settings.useMinSpacing
+			and "最小間隔チェック: ON"
+		or "最小間隔チェック: OFF"
+	multiSelectModeButton.Text = multiSelectMode and "複数選択: ON" or "単一選択"
+	multiSelectModeButton.BackgroundColor3 = multiSelectMode and COLORS.accent or COLORS.panel
+	singlePlacementButton.Text = placementActive and "単体 終了" or "単体配置"
+	singlePlacementButton.BackgroundColor3 = placementActive and COLORS.danger or COLORS.accent
+	paintButton.Text = paintActive and "ペイント 終了" or "ペイント"
+	paintButton.BackgroundColor3 = paintActive and COLORS.danger or COLORS.accent
+	eraseButton.Text = eraseActive and "消去 終了" or "消しゴム"
+	eraseButton.BackgroundColor3 = eraseActive and COLORS.danger or COLORS.panel
+	if settings.refreshActiveWeights then
+		settings.refreshActiveWeights()
+	end
+end
+
+settings.refreshPresetUI = function()
+	local names = {}
+	for name in pairs(settings.presets) do
+		table.insert(names, name)
+	end
+	table.sort(names, function(a, b)
+		return string.lower(a) < string.lower(b)
+	end)
+	settings.presetNames = names
+	if settings.currentPresetName and settings.presets[settings.currentPresetName] then
+		settings.presetCycleButton.Text = "プリセット: " .. settings.currentPresetName .. "  ▶"
+	else
+		settings.currentPresetName = names[1]
+		settings.presetCycleButton.Text = settings.currentPresetName
+				and ("プリセット: " .. settings.currentPresetName .. "  ▶")
+			or "プリセット: なし"
+	end
+end
+
+settings.savePreset = function()
+	readSettings()
+	local name = string.match(settings.presetNameField.Text, "^%s*(.-)%s*$")
+	if not name or name == "" then
+		setPlacementStatus("プリセット名を入力してください", true)
+		return
+	end
+	local preset = {
+		version = 1,
+		palette = currentPaletteName,
+		settings = {
+			scaleMin = settings.scaleMin,
+			scaleMax = settings.scaleMax,
+			yawMin = settings.yawMin,
+			yawMax = settings.yawMax,
+			count = settings.count,
+			alignToSurface = settings.alignToSurface,
+			batchSurfaceMode = settings.batchSurfaceMode,
+			brushRadius = settings.brushRadius,
+			brushDensity = settings.brushDensity,
+			minSpacing = settings.minSpacing,
+			useMinSpacing = settings.useMinSpacing,
+			densityMode = settings.densityMode,
+			singleRotationSnapEnabled = settings.singleRotationSnapEnabled,
+			rotationSnapAngle = settings.rotationSnapAngle,
+		},
+		assets = {},
+	}
+	for _, asset in ipairs(selectedAssetList()) do
+		table.insert(preset.assets, {
+			id = assetId(asset),
+			name = asset.Name,
+			weight = assetWeight(asset),
+			overrideEnabled = asset:GetAttribute("PropPainterOverrideEnabled") == true,
+			scaleMin = asset:GetAttribute("PropPainterScaleMin"),
+			scaleMax = asset:GetAttribute("PropPainterScaleMax"),
+			yawMin = asset:GetAttribute("PropPainterYawMin"),
+			yawMax = asset:GetAttribute("PropPainterYawMax"),
+			alignToSurface = asset:GetAttribute("PropPainterAlignToSurface"),
+		})
+	end
+	settings.presets[name] = preset
+	settings.currentPresetName = name
+	pcall(function()
+		plugin:SetSetting("PropPainterPresetsV1", settings.presets)
+	end)
+	settings.refreshPresetUI()
+	setPlacementStatus(name .. " を保存しました")
+end
+
+settings.loadPreset = function()
+	local name = settings.currentPresetName
+	local preset = name and settings.presets[name]
+	if type(preset) ~= "table" then
+		setPlacementStatus("読み込むプリセットを選択してください", true)
+		return
+	end
+	if type(preset.settings) == "table" then
+		for _, key in ipairs({
+			"scaleMin",
+			"scaleMax",
+			"yawMin",
+			"yawMax",
+			"count",
+			"alignToSurface",
+			"batchSurfaceMode",
+			"brushRadius",
+			"brushDensity",
+			"minSpacing",
+			"useMinSpacing",
+			"densityMode",
+			"singleRotationSnapEnabled",
+			"rotationSnapAngle",
+		}) do
+			if preset.settings[key] ~= nil then
+				settings[key] = preset.settings[key]
+			end
+		end
+	end
+	if type(preset.palette) == "string"
+		and libraryRoot():FindFirstChild(preset.palette)
+	then
+		currentPaletteName = preset.palette
+	end
+	settings.syncFieldsFromSettings()
+	settings.savePreferences()
+	table.clear(selectedAssets)
+	selectedAsset = nil
+	local palette = currentPalette()
+	for _, record in ipairs(type(preset.assets) == "table" and preset.assets or {}) do
+		local found
+		for _, candidate in ipairs(palette:GetChildren()) do
+			if isPlaceableAsset(candidate)
+				and (
+					(type(record.id) == "string"
+						and record.id ~= ""
+						and candidate:GetAttribute(ASSET_ID_ATTRIBUTE) == record.id)
+					or candidate.Name == record.name
+				)
+			then
+				found = candidate
+				break
+			end
+		end
+		if found then
+			found:SetAttribute("PropPainterWeight", record.weight or 1)
+			found:SetAttribute("PropPainterOverrideEnabled", record.overrideEnabled == true)
+			found:SetAttribute("PropPainterScaleMin", record.scaleMin or settings.scaleMin)
+			found:SetAttribute("PropPainterScaleMax", record.scaleMax or settings.scaleMax)
+			found:SetAttribute("PropPainterYawMin", record.yawMin or settings.yawMin)
+			found:SetAttribute("PropPainterYawMax", record.yawMax or settings.yawMax)
+			if type(record.alignToSurface) == "boolean" then
+				found:SetAttribute("PropPainterAlignToSurface", record.alignToSurface)
+			end
+			selectedAssets[found] = true
+			selectedAsset = found
+		end
+	end
+	refreshLibrary()
+	settings.presetNameField.Text = name
+	setPlacementStatus(name .. " を読み込みました")
+end
+
+settings.deletePreset = function()
+	local name = settings.currentPresetName
+	if not name or not settings.presets[name] then
+		setPlacementStatus("削除するプリセットを選択してください", true)
+		return
+	end
+	settings.presets[name] = nil
+	settings.currentPresetName = nil
+	pcall(function()
+		plugin:SetSetting("PropPainterPresetsV1", settings.presets)
+	end)
+	settings.refreshPresetUI()
+	setPlacementStatus(name .. " を削除しました")
+end
+
+local function switchTab(showPlacement, showManagement)
+	showManagement = showManagement == true
+	libraryPanel.Visible = not showPlacement and not showManagement
+	placementPanel.Visible = showPlacement
+	settings.managementPanel.Visible = showManagement
+	libraryTabButton.BackgroundColor3 = (not showPlacement and not showManagement) and COLORS.accent or COLORS.panel
+	placementTabButton.BackgroundColor3 = showPlacement and COLORS.accent or COLORS.panel
+	settings.managementTabButton.BackgroundColor3 = showManagement and COLORS.accent or COLORS.panel
+	if showPlacement then
+		readSettings()
+	elseif showManagement then
+		settings.refreshManagement()
+	end
+end
+
+local function adjustActiveSize(direction)
+	if not (placementActive or paintActive or eraseActive) then
+		return
+	end
+	readSettings()
+	local fineAdjustment = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+		or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+	local multiplier = fineAdjustment and 1.05 or 1.2
+	if placementActive then
+		if direction < 0 then
+			settings.scaleMin /= multiplier
+			settings.scaleMax /= multiplier
+		else
+			settings.scaleMin *= multiplier
+			settings.scaleMax *= multiplier
+		end
+		settings.scaleMin = math.clamp(settings.scaleMin, 0.05, 20)
+		settings.scaleMax = math.clamp(settings.scaleMax, settings.scaleMin, 20)
+		scaleMinField.Text = string.format("%.2f", settings.scaleMin)
+		scaleMaxField.Text = string.format("%.2f", settings.scaleMax)
+		updateNumericSliderVisual("scaleMin")
+		updateNumericSliderVisual("scaleMax")
+		makePreview()
+		updatePreview()
+		setPlacementStatus(string.format(
+			"単体配置サイズ: %.2f ～ %.2f",
+			settings.scaleMin,
+			settings.scaleMax
+		))
+		return
+	end
+	if direction < 0 then
+		settings.brushRadius /= multiplier
+	else
+		settings.brushRadius *= multiplier
+	end
+	settings.brushRadius = math.clamp(settings.brushRadius, 0.5, 500)
+	brushRadiusField.Text = string.format("%.2f", settings.brushRadius)
+	updateNumericSliderVisual("brushRadius")
+	if brushVisual then
+		brushVisual.Size = Vector3.new(0.08, settings.brushRadius * 2, settings.brushRadius * 2)
+	end
+	setPlacementStatus(string.format("ブラシ半径: %.2f Stud", settings.brushRadius))
+end
+
+local function clearPreview()
+	if previewConnection then
+		previewConnection:Disconnect()
+		previewConnection = nil
+	end
+	if previewModel then
+		previewModel:Destroy()
+		previewModel = nil
+	end
+	previewAsset = nil
+	previewHitPosition = nil
+	previewHitNormal = nil
+end
+
+local function previewRaycast()
+	local rayParameters = RaycastParams.new()
+	rayParameters.FilterType = Enum.RaycastFilterType.Exclude
+	local excludes = {}
+	if previewModel then
+		table.insert(excludes, previewModel)
+	end
+	local pivotEdit = Workspace:FindFirstChild(TEMP_EDIT_NAME)
+	if pivotEdit then
+		table.insert(excludes, pivotEdit)
+	end
+	rayParameters.FilterDescendantsInstances = excludes
+	return Workspace:Raycast(mouse.UnitRay.Origin, mouse.UnitRay.Direction * 4096, rayParameters)
+end
+
+makePreview = function()
+	local asset = assetForSeed(previewSeed)
+	if not asset or not asset.Parent then
+		return false
+	end
+	if previewModel then
+		previewModel:Destroy()
+	end
+	readSettings()
+	local scale, yaw = randomTransform(previewSeed, asset)
+	yaw += settings.singleYawOffset
+	if settings.singleRotationSnapEnabled then
+		yaw = math.round(yaw / settings.rotationSnapAngle) * settings.rotationSnapAngle
+	end
+	local clone = asset:Clone()
+	clone.Name = "__PropPainterPreview"
+	scaleInstance(clone, scale)
+	forEachPart(clone, function(part)
+		part.Anchored = true
+		part.CanCollide = false
+		part.CanQuery = false
+		part.CanTouch = false
+		part.Transparency = math.max(part.Transparency, 0.55)
+	end)
+	clone:SetAttribute("__PropPainterPreview", true)
+	clone.Parent = Workspace
+	previewModel = clone
+	previewAsset = asset
+	if previewHitPosition and previewHitNormal then
+		local localPivot = scaledPlacementPivot(asset, scale)
+		pivotTo(
+			clone,
+			targetPlacementCFrame(previewHitPosition, previewHitNormal, yaw, asset) * localPivot:Inverse()
+		)
+	end
+	return true
+end
+
+updatePreview = function()
+	if not placementActive then
+		return
+	end
+	if not previewModel or not previewModel.Parent then
+		if not makePreview() then
+			return
+		end
+	end
+	if settings.singleRotationDragging and previewHitPosition and previewHitNormal then
+		local asset = previewAsset or assetForSeed(previewSeed)
+		if not asset then
+			return
+		end
+		local scale, yaw = randomTransform(previewSeed, asset)
+		yaw += settings.singleYawOffset
+		if settings.singleRotationSnapEnabled then
+			yaw = math.round(yaw / settings.rotationSnapAngle) * settings.rotationSnapAngle
+		end
+		local localPivot = scaledPlacementPivot(asset, scale)
+		pivotTo(
+			previewModel,
+			targetPlacementCFrame(previewHitPosition, previewHitNormal, yaw, asset) * localPivot:Inverse()
+		)
+		return
+	end
+	local result = previewRaycast()
+	if not result then
+		previewHitPosition = nil
+		previewHitNormal = nil
+		return
+	end
+	previewHitPosition = result.Position
+	previewHitNormal = result.Normal
+	local asset = previewAsset or assetForSeed(previewSeed)
+	if not asset then
+		return
+	end
+	local scale, yaw = randomTransform(previewSeed, asset)
+	yaw += settings.singleYawOffset
+	if settings.singleRotationSnapEnabled then
+		yaw = math.round(yaw / settings.rotationSnapAngle) * settings.rotationSnapAngle
+	end
+	local localPivot = scaledPlacementPivot(asset, scale)
+	pivotTo(
+		previewModel,
+		targetPlacementCFrame(result.Position, result.Normal, yaw, asset) * localPivot:Inverse()
+	)
+end
+
+stopPlacement = function(silent, keepPluginActive)
+	if not placementActive then
+		return
+	end
+	placementActive = false
+	settings.singleRotationDragging = false
+	settings.singleRotationLastX = nil
+	settings.singleYawOffset = 0
+	clearPreview()
+	if not keepPluginActive then
+		plugin:Deactivate()
+	end
+	updateSelectedAssetUI()
+	if not silent then
+		setPlacementStatus("単体配置を終了しました")
+	end
+end
+
+local function startPlacement()
+	if placementActive then
+		stopPlacement(false)
+		return
+	end
+	local switchingMode = paintActive or eraseActive
+	if paintActive or eraseActive then
+		stopBrushMode(true, true)
+	end
+	if pivotSession then
+		setPlacementStatus("先にPivot編集を終了してください", true)
+		return
+	end
+	if #selectedAssetList() == 0 then
+		setPlacementStatus("先にプロップを選択してください", true)
+		return
+	end
+	readSettings()
+	if not switchingMode then
+		plugin:Activate(true)
+	end
+	placementActive = true
+	previewSeed = randomSource:NextInteger(1, 2147483646)
+	settings.singleRotationDragging = false
+	settings.singleRotationLastX = nil
+	settings.singleYawOffset = 0
+	if not makePreview() then
+		placementActive = false
+		setPlacementStatus("プレビューを作成できませんでした", true)
+		return
+	end
+	previewConnection = RunService.RenderStepped:Connect(updatePreview)
+	updateSelectedAssetUI()
+	setPlacementStatus("左クリック位置に固定し、左右ドラッグで回転。Escで終了。")
+end
+
+local function placePreviewProp()
+	if not placementActive
+		or not previewAsset
+		or not previewAsset.Parent
+		or not previewHitPosition
+		or not previewHitNormal
+	then
+		return
+	end
+	local recording = beginRecording("PropPainterPlaceOne", "Prop Painter: 単体配置")
+	if not recording then
+		setPlacementStatus("Undo記録を開始できませんでした", true)
+		return
+	end
+	local _, placementYaw = randomTransform(previewSeed, previewAsset)
+	placementYaw += settings.singleYawOffset
+	if settings.singleRotationSnapEnabled then
+		placementYaw = math.round(placementYaw / settings.rotationSnapAngle) * settings.rotationSnapAngle
+	end
+	local ok, result = pcall(function()
+		return createPlacedProp(
+			previewAsset,
+			previewHitPosition,
+			previewHitNormal,
+			previewSeed,
+			"Single",
+			placementYaw
+		)
+	end)
+	finishRecording(recording, ok)
+	if not ok then
+		setPlacementStatus("配置に失敗しました: " .. tostring(result), true)
+		return
+	end
+	previewSeed = randomSource:NextInteger(1, 2147483646)
+	settings.singleYawOffset = 0
+	makePreview()
+	updatePreview()
+	setPlacementStatus(result.Name .. " を配置しました")
+end
+
+local function brushRaycast(origin, direction)
+	local rayParameters = RaycastParams.new()
+	rayParameters.FilterType = Enum.RaycastFilterType.Exclude
+	local excludes = {}
+	local existingOutput = Workspace:FindFirstChild(OUTPUT_NAME)
+	if existingOutput then
+		table.insert(excludes, existingOutput)
+	end
+	if brushVisual then
+		table.insert(excludes, brushVisual)
+	end
+	local pivotEdit = Workspace:FindFirstChild(TEMP_EDIT_NAME)
+	if pivotEdit then
+		table.insert(excludes, pivotEdit)
+	end
+	rayParameters.FilterDescendantsInstances = excludes
+	return Workspace:Raycast(origin, direction, rayParameters)
+end
+
+local function brushMouseRaycast()
+	return brushRaycast(mouse.UnitRay.Origin, mouse.UnitRay.Direction * 4096)
+end
+
+local function destroyBrushVisual()
+	if brushVisual then
+		brushVisual:Destroy()
+		brushVisual = nil
+	end
+	brushHitPosition = nil
+	brushHitNormal = nil
+end
+
+local function makeBrushVisual()
+	destroyBrushVisual()
+	local visual = Instance.new("Part")
+	visual.Name = "__PropPainterBrush"
+	visual.Shape = Enum.PartType.Cylinder
+	visual.Anchored = true
+	visual.CanCollide = false
+	visual.CanQuery = false
+	visual.CanTouch = false
+	visual.CastShadow = false
+	visual.Locked = true
+	visual.Material = Enum.Material.Neon
+	visual.Color = eraseActive and Color3.fromRGB(255, 96, 88) or Color3.fromRGB(75, 180, 255)
+	visual.Transparency = 0.72
+	visual.Size = Vector3.new(0.08, settings.brushRadius * 2, settings.brushRadius * 2)
+	visual.Parent = Workspace
+	brushVisual = visual
+end
+
+local function spatialKey(position, cellSize)
+	return string.format(
+		"%d:%d:%d",
+		math.floor(position.X / cellSize),
+		math.floor(position.Y / cellSize),
+		math.floor(position.Z / cellSize)
+	)
+end
+
+local function makeSpatialIndex(includeExisting)
+	local index = {
+		cellSize = math.max(settings.minSpacing, 1),
+		buckets = {},
+	}
+	if includeExisting then
+		local existingOutput = Workspace:FindFirstChild(OUTPUT_NAME)
+		if existingOutput then
+			for _, descendant in ipairs(existingOutput:GetDescendants()) do
+				if descendant:GetAttribute(GENERATED_ATTRIBUTE) == true
+					and (descendant:IsA("Model") or descendant:IsA("BasePart"))
+				then
+					local position = descendant:GetAttribute("PropPainterPosition")
+					if typeof(position) ~= "Vector3" then
+						position = getPivot(descendant).Position
+					end
+					local key = spatialKey(position, index.cellSize)
+					index.buckets[key] = index.buckets[key] or {}
+					table.insert(index.buckets[key], position)
+				end
+			end
+		end
+	end
+	return index
+end
+
+local function spatialInsert(index, position)
+	local key = spatialKey(position, index.cellSize)
+	index.buckets[key] = index.buckets[key] or {}
+	table.insert(index.buckets[key], position)
+end
+
+local function spatialHasNearby(index, position, distance)
+	if not index or distance <= 0 then
+		return false
+	end
+	local cellSize = index.cellSize
+	local radius = math.max(1, math.ceil(distance / cellSize))
+	local centerX = math.floor(position.X / cellSize)
+	local centerY = math.floor(position.Y / cellSize)
+	local centerZ = math.floor(position.Z / cellSize)
+	local distanceSquared = distance * distance
+	for x = centerX - radius, centerX + radius do
+		for y = centerY - radius, centerY + radius do
+			for z = centerZ - radius, centerZ + radius do
+				local bucket = index.buckets[string.format("%d:%d:%d", x, y, z)]
+				if bucket then
+					for _, existingPosition in ipairs(bucket) do
+						if (existingPosition - position).Magnitude ^ 2 < distanceSquared then
+							return true
+						end
+					end
+				end
+			end
+		end
+	end
+	return false
+end
+
+local function tangentAxes(normal)
+	local normalized = normal.Magnitude > 0 and normal.Unit or Vector3.yAxis
+	local helper = math.abs(normalized:Dot(Vector3.yAxis)) > 0.95
+			and Vector3.xAxis
+		or Vector3.yAxis
+	local tangent = normalized:Cross(helper).Unit
+	local bitangent = normalized:Cross(tangent).Unit
+	return tangent, bitangent
+end
+
+local function sampledBrushSurface(center, normal, rng)
+	local tangent, bitangent = tangentAxes(normal)
+	local angle = rng:NextNumber(0, math.pi * 2)
+	local radius = math.sqrt(rng:NextNumber()) * settings.brushRadius
+	local planarPosition = center
+		+ tangent * (math.cos(angle) * radius)
+		+ bitangent * (math.sin(angle) * radius)
+	local castDistance = math.max(settings.brushRadius * 2 + 16, 32)
+	return brushRaycast(
+		planarPosition + normal * (castDistance * 0.5),
+		-normal * castDistance
+	)
+end
+
+local function paintStamp(center, normal)
+	if not strokeSpatialIndex then
+		return
+	end
+	local rng = Random.new(randomSource:NextInteger(1, 2147483646))
+	local placedCount = 0
+	for _ = 1, settings.brushDensity do
+		local result = sampledBrushSurface(center, normal, rng)
+		if result then
+			local canPlace = not settings.useMinSpacing
+				or not spatialHasNearby(strokeSpatialIndex, result.Position, settings.minSpacing)
+			if canPlace then
+				local seed = rng:NextInteger(1, 2147483646)
+				local asset = chooseWeightedAsset(rng)
+				if asset then
+					local ok = pcall(function()
+						createPlacedProp(asset, result.Position, result.Normal, seed, "Paint")
+					end)
+					if ok then
+						spatialInsert(strokeSpatialIndex, result.Position)
+						table.insert(strokePlacedPositions, result.Position)
+						placedCount += 1
+						strokeChanged = true
+					end
+				end
+			end
+		end
+	end
+	if placedCount > 0 then
+		setPlacementStatus(string.format("ペイント中: %d個追加", placedCount))
+	end
+end
+
+local function generatedRoots()
+	local roots = {}
+	local existingOutput = Workspace:FindFirstChild(OUTPUT_NAME)
+	if not existingOutput then
+		return roots
+	end
+	for _, descendant in ipairs(existingOutput:GetDescendants()) do
+		if descendant:GetAttribute(GENERATED_ATTRIBUTE) == true
+			and (descendant:IsA("Model") or descendant:IsA("BasePart"))
+		then
+			table.insert(roots, descendant)
+		end
+	end
+	return roots
+end
+
+local function eraseStamp(center)
+	local removedCount = 0
+	for _, root in ipairs(generatedRoots()) do
+		local position = root:GetAttribute("PropPainterPosition")
+		if typeof(position) ~= "Vector3" then
+			position = getPivot(root).Position
+		end
+		if (position - center).Magnitude <= settings.brushRadius then
+			root:Destroy()
+			removedCount += 1
+			strokeChanged = true
+		end
+	end
+	if removedCount > 0 then
+		setPlacementStatus(string.format("消去中: %d個削除", removedCount))
+	end
+end
+
+local function stampAtBrush()
+	if not strokeActive or not brushHitPosition or not brushHitNormal then
+		return
+	end
+	if paintActive then
+		paintStamp(brushHitPosition, brushHitNormal)
+	elseif eraseActive then
+		eraseStamp(brushHitPosition)
+	end
+	strokeLastPosition = brushHitPosition
+end
+
+local function finishStroke()
+	if not strokeActive then
+		return
+	end
+	strokeActive = false
+	finishRecording(strokeRecording, strokeChanged)
+	strokeRecording = nil
+	strokeSpatialIndex = nil
+	strokePlacedPositions = nil
+	strokeLastPosition = nil
+	if strokeChanged then
+		setPlacementStatus(paintActive and "ペイントを確定しました" or "消去を確定しました")
+	end
+	strokeChanged = false
+end
+
+local function beginStroke()
+	if strokeActive or not (paintActive or eraseActive) or not brushHitPosition then
+		return
+	end
+	local recordingName = paintActive and "PropPainterPaintStroke" or "PropPainterEraseStroke"
+	local displayName = paintActive and "Prop Painter: ペイント" or "Prop Painter: 消しゴム"
+	local recording = beginRecording(recordingName, displayName)
+	if not recording then
+		setPlacementStatus("Undo記録を開始できませんでした", true)
+		return
+	end
+	strokeRecording = recording
+	strokeActive = true
+	strokeChanged = false
+	strokeLastPosition = nil
+	strokePlacedPositions = {}
+	if paintActive then
+		strokeSpatialIndex = makeSpatialIndex(settings.densityMode == "Maintain")
+	end
+	stampAtBrush()
+end
+
+local function updateBrush()
+	if not (paintActive or eraseActive) then
+		return
+	end
+	if not brushVisual or not brushVisual.Parent then
+		makeBrushVisual()
+	end
+	if not brushVisual then
+		return
+	end
+	local result = brushMouseRaycast()
+	if not result then
+		brushVisual.Transparency = 1
+		brushHitPosition = nil
+		brushHitNormal = nil
+		return
+	end
+	brushHitPosition = result.Position
+	brushHitNormal = result.Normal
+	brushVisual.Transparency = 0.72
+	brushVisual.Size = Vector3.new(0.08, settings.brushRadius * 2, settings.brushRadius * 2)
+	brushVisual.CFrame = CFrame.new(result.Position + result.Normal * 0.05)
+		* surfaceRotation(result.Normal)
+		* CFrame.Angles(0, 0, math.pi * 0.5)
+	if strokeActive then
+		local stepDistance = math.max(0.5, settings.brushRadius * 0.25)
+		if not strokeLastPosition or (brushHitPosition - strokeLastPosition).Magnitude >= stepDistance then
+			stampAtBrush()
+		end
+	end
+end
+
+stopBrushMode = function(silent, keepPluginActive)
+	if not (paintActive or eraseActive or strokeActive) then
+		return
+	end
+	finishStroke()
+	paintActive = false
+	eraseActive = false
+	if brushConnection then
+		brushConnection:Disconnect()
+		brushConnection = nil
+	end
+	destroyBrushVisual()
+	if not keepPluginActive then
+		plugin:Deactivate()
+	end
+	updateSelectedAssetUI()
+	if not silent then
+		setPlacementStatus("ブラシ操作を終了しました")
+	end
+end
+
+local function startBrushMode(mode)
+	local isSameMode = (mode == "Paint" and paintActive) or (mode == "Erase" and eraseActive)
+	if isSameMode then
+		stopBrushMode(false)
+		return
+	end
+	local switchingMode = placementActive or paintActive or eraseActive
+	if placementActive then
+		stopPlacement(true, true)
+	end
+	if paintActive or eraseActive then
+		stopBrushMode(true, true)
+	end
+	if pivotSession then
+		setPlacementStatus("先にPivot編集を終了してください", true)
+		return
+	end
+	if mode == "Paint" and #selectedAssetList() == 0 then
+		local fallbackAssets = {}
+		for _, child in ipairs(currentPalette():GetChildren()) do
+			if isPlaceableAsset(child) then
+				table.insert(fallbackAssets, child)
+			end
+		end
+		table.sort(fallbackAssets, function(a, b)
+			return string.lower(a.Name) < string.lower(b.Name)
+		end)
+		if #fallbackAssets > 0 then
+			selectOnlyAsset(fallbackAssets[1])
+			updateSelectedAssetUI()
+			updateCardHighlights()
+		else
+			setPlacementStatus("ライブラリにペイント可能なプロップがありません", true)
+			placementAssetLabel.Text = "開始不可: ライブラリが空です"
+			placementAssetLabel.TextColor3 = Color3.fromRGB(255, 166, 158)
+			return
+		end
+	end
+	readSettings()
+	paintActive = mode == "Paint"
+	eraseActive = mode == "Erase"
+	local startOk, startError = pcall(function()
+		if not switchingMode then
+			plugin:Activate(true)
+		end
+		makeBrushVisual()
+		brushConnection = RunService.RenderStepped:Connect(function()
+			local updateOk, updateError = pcall(updateBrush)
+			if not updateOk then
+				setPlacementStatus("ブラシ更新エラー: " .. tostring(updateError), true)
+				placementAssetLabel.Text = "ブラシ更新エラー（状態欄を確認）"
+				placementAssetLabel.TextColor3 = Color3.fromRGB(255, 166, 158)
+			end
+		end)
+	end)
+	if not startOk then
+		paintActive = false
+		eraseActive = false
+		destroyBrushVisual()
+		setPlacementStatus("ブラシを開始できません: " .. tostring(startError), true)
+		updateSelectedAssetUI()
+		placementAssetLabel.Text = "ブラシ開始エラー（状態欄を確認）"
+		placementAssetLabel.TextColor3 = Color3.fromRGB(255, 166, 158)
+		return
+	end
+	updateSelectedAssetUI()
+	setPlacementStatus(
+		paintActive
+			and "左ドラッグでペイントします。Escで終了。"
+			or "左ドラッグで生成済みプロップを消去します。Escで終了。"
+	)
+end
+
+local FACE_DEFINITIONS = {
+	{ axis = "X", sign = 1 },
+	{ axis = "X", sign = -1 },
+	{ axis = "Y", sign = 1 },
+	{ axis = "Y", sign = -1 },
+	{ axis = "Z", sign = 1 },
+	{ axis = "Z", sign = -1 },
+}
+
+local function collectSelectedParts()
+	local parts = {}
+	local seen = {}
+	local existingOutput = Workspace:FindFirstChild(OUTPUT_NAME)
+	local pivotEdit = Workspace:FindFirstChild(TEMP_EDIT_NAME)
+	local function add(part)
+		if not seen[part]
+			and part:IsDescendantOf(Workspace)
+			and (not existingOutput or not part:IsDescendantOf(existingOutput))
+			and (not pivotEdit or not part:IsDescendantOf(pivotEdit))
+		then
+			seen[part] = true
+			table.insert(parts, part)
+		end
+	end
+	for _, item in ipairs(Selection:Get()) do
+		if item:IsA("BasePart") then
+			add(item)
+		elseif item:IsA("Model") or item:IsA("Folder") then
+			for _, descendant in ipairs(item:GetDescendants()) do
+				if descendant:IsA("BasePart") then
+					add(descendant)
+				end
+			end
+		end
+	end
+	return parts
+end
+
+local function faceArea(size, axis)
+	if axis == "X" then
+		return size.Y * size.Z
+	elseif axis == "Y" then
+		return size.X * size.Z
+	end
+	return size.X * size.Y
+end
+
+local function buildSurfaceEntries(parts)
+	local entries = {}
+	local totalArea = 0
+	for _, part in ipairs(parts) do
+		if settings.batchSurfaceMode == "Top" then
+			local area = part.Size.X * part.Size.Z
+			totalArea += area
+			table.insert(entries, {
+				part = part,
+				axis = "Y",
+				sign = 1,
+				area = area,
+				cumulative = totalArea,
+			})
+		else
+			for _, face in ipairs(FACE_DEFINITIONS) do
+				local area = faceArea(part.Size, face.axis)
+				totalArea += area
+				table.insert(entries, {
+					part = part,
+					axis = face.axis,
+					sign = face.sign,
+					area = area,
+					cumulative = totalArea,
+				})
+			end
+		end
+	end
+	return entries, totalArea
+end
+
+local function sampleSurface(entries, totalArea, rng)
+	local chosenValue = rng:NextNumber(0, totalArea)
+	local entry = entries[#entries]
+	for _, candidate in ipairs(entries) do
+		if chosenValue <= candidate.cumulative then
+			entry = candidate
+			break
+		end
+	end
+	local size = entry.part.Size
+	local localPosition
+	local localNormal
+	if entry.axis == "X" then
+		localPosition = Vector3.new(
+			entry.sign * size.X * 0.5,
+			rng:NextNumber(-size.Y * 0.5, size.Y * 0.5),
+			rng:NextNumber(-size.Z * 0.5, size.Z * 0.5)
+		)
+		localNormal = Vector3.new(entry.sign, 0, 0)
+	elseif entry.axis == "Y" then
+		localPosition = Vector3.new(
+			rng:NextNumber(-size.X * 0.5, size.X * 0.5),
+			entry.sign * size.Y * 0.5,
+			rng:NextNumber(-size.Z * 0.5, size.Z * 0.5)
+		)
+		localNormal = Vector3.new(0, entry.sign, 0)
+	else
+		localPosition = Vector3.new(
+			rng:NextNumber(-size.X * 0.5, size.X * 0.5),
+			rng:NextNumber(-size.Y * 0.5, size.Y * 0.5),
+			entry.sign * size.Z * 0.5
+		)
+		localNormal = Vector3.new(0, 0, entry.sign)
+	end
+	return entry.part.CFrame:PointToWorldSpace(localPosition),
+		entry.part.CFrame:VectorToWorldSpace(localNormal).Unit
+end
+
+local function batchGenerate()
+	if placementActive then
+		stopPlacement(true)
+	end
+	if paintActive or eraseActive then
+		stopBrushMode(true)
+	end
+	if pivotSession then
+		setPlacementStatus("先にPivot編集を終了してください", true)
+		return
+	end
+	if #selectedAssetList() == 0 then
+		setPlacementStatus("先にプロップを選択してください", true)
+		return
+	end
+	readSettings()
+	local parts = collectSelectedParts()
+	if #parts == 0 then
+		setPlacementStatus("生成範囲にするPartまたはModelを選択してください", true)
+		return
+	end
+	local entries, totalArea = buildSurfaceEntries(parts)
+	if totalArea <= 0 or #entries == 0 then
+		setPlacementStatus("選択範囲の面積を取得できませんでした", true)
+		return
+	end
+	local recording = beginRecording("PropPainterBatchGenerate", "Prop Painter: 一括生成")
+	if not recording then
+		setPlacementStatus("Undo記録を開始できませんでした", true)
+		return
+	end
+	local placed = {}
+	local batchSeed = randomSource:NextInteger(1, 2147483646)
+	local rng = Random.new(batchSeed)
+	local ok, errorMessage = pcall(function()
+		for _ = 1, settings.count do
+			local position, normal = sampleSurface(entries, totalArea, rng)
+			local seed = rng:NextInteger(1, 2147483646)
+			local asset = chooseWeightedAsset(rng)
+			if asset then
+				table.insert(placed, createPlacedProp(asset, position, normal, seed, "Batch"))
+			end
+		end
+	end)
+	finishRecording(recording, ok)
+	if not ok then
+		setPlacementStatus("一括生成に失敗しました: " .. tostring(errorMessage), true)
+		return
+	end
+	setPlacementStatus(string.format("%d個のプロップを生成しました", #placed))
+end
+
+local function destroyPivotSession()
+	if not pivotSession then
+		return
+	end
+	local container = pivotSession.container
+	pivotSession = nil
+	if container and container.Parent then
+		container:Destroy()
+	end
+	pivotActions.Visible = false
+	settings.activeWeightPanel.Visible = true
+	assetGrid.Position = UDim2.fromOffset(0, 378)
+	assetGrid.Size = UDim2.new(1, 0, 1, -426)
+end
+
+local function startPivotEdit()
+	if placementActive then
+		stopPlacement(true)
+	end
+	if paintActive or eraseActive then
+		stopBrushMode(true)
+	end
+	if pivotSession then
+		setLibraryStatus("すでにPivotを編集中です", true)
+		return
+	end
+	if not selectedAsset or not selectedAsset.Parent then
+		setLibraryStatus("先にプロップを選択してください", true)
+		return
+	end
+	local existing = Workspace:FindFirstChild(TEMP_EDIT_NAME)
+	if existing then
+		existing:Destroy()
+	end
+	local container = Instance.new("Model")
+	container.Name = TEMP_EDIT_NAME
+	container:SetAttribute("__PropPainterTemporary", true)
+	container.Parent = Workspace
+
+	local editModel = selectedAsset:Clone()
+	editModel.Name = selectedAsset.Name .. "_PivotPreview"
+	forEachPart(editModel, function(part)
+		part.Anchored = true
+		part.CanCollide = false
+		part.CanQuery = false
+		part.CanTouch = false
+	end)
+	editModel.Parent = container
+
+	local boundsCFrame, boundsSize = getBounds(editModel)
+	local handleSize = math.clamp(math.max(boundsSize.X, boundsSize.Y, boundsSize.Z) * 0.08, 0.5, 3)
+	local handle = Instance.new("Part")
+	handle.Name = "PlacementPivotHandle"
+	handle.Anchored = true
+	handle.CanCollide = false
+	handle.CanQuery = false
+	handle.CanTouch = false
+	handle.Color = COLORS.pivot
+	handle.Material = Enum.Material.Neon
+	handle.Size = Vector3.one * handleSize
+	handle.Transparency = 0.08
+	handle.CFrame = getPivot(editModel) * placementPivot(selectedAsset)
+	handle.Parent = container
+
+	local selectionBox = Instance.new("SelectionBox")
+	selectionBox.Adornee = handle
+	selectionBox.Color3 = COLORS.pivot
+	selectionBox.LineThickness = 0.05
+	selectionBox.SurfaceTransparency = 0.8
+	selectionBox.Parent = handle
+
+	pivotSession = {
+		asset = selectedAsset,
+		container = container,
+		editModel = editModel,
+		handle = handle,
+		previousSelection = Selection:Get(),
+	}
+	Selection:Set({ handle })
+	local camera = Workspace.CurrentCamera
+	if camera then
+		pcall(function()
+			camera:ZoomToExtents(boundsCFrame, boundsSize * 1.4)
+		end)
+	end
+	pivotActions.Visible = true
+	settings.activeWeightPanel.Visible = false
+	assetGrid.Position = UDim2.fromOffset(0, 232)
+	assetGrid.Size = UDim2.new(1, 0, 1, -280)
+	setLibraryStatus("オレンジのハンドルを移動・回転し、保存して終了してください")
+end
+
+finishPivotEdit = function(save)
+	if not pivotSession then
+		return
+	end
+	local session = pivotSession
+	if save and session.asset and session.asset.Parent then
+		local recording = beginRecording("PropPainterEditPivot", "Prop Painter: 配置Pivotを更新")
+		if not recording then
+			setLibraryStatus("Undo記録を開始できませんでした", true)
+			return
+		end
+		local ok, errorMessage = pcall(function()
+			local localPivot = getPivot(session.editModel):ToObjectSpace(session.handle.CFrame)
+			session.asset:SetAttribute(PIVOT_ATTRIBUTE, localPivot)
+		end)
+		finishRecording(recording, ok)
+		if not ok then
+			setLibraryStatus("Pivot保存に失敗しました: " .. tostring(errorMessage), true)
+			return
+		end
+	end
+	local previousSelection = session.previousSelection
+	destroyPivotSession()
+	if previousSelection then
+		local existingSelection = {}
+		for _, item in ipairs(previousSelection) do
+			if item.Parent then
+				table.insert(existingSelection, item)
+			end
+		end
+		Selection:Set(existingSelection)
+	end
+	setLibraryStatus(save and "配置Pivotを保存しました" or "Pivot編集をキャンセルしました")
+end
+
+local function resetPivotHandle()
+	if not pivotSession then
+		return
+	end
+	pivotSession.handle.CFrame =
+		getPivot(pivotSession.editModel) * defaultPlacementPivot(pivotSession.editModel)
+	Selection:Set({ pivotSession.handle })
+	setLibraryStatus("PivotをBoundingBox底面へ戻しました。保存すると確定します。")
+end
+
+paletteButton.Activated:Connect(function()
+	if pivotSession then
+		setLibraryStatus("先にPivot編集を終了してください", true)
+		return
+	end
+	if placementActive then
+		stopPlacement(true)
+	end
+	if paintActive or eraseActive then
+		stopBrushMode(true)
+	end
+	local folders = paletteFolders()
+	if #folders == 0 then
+		return
+	end
+	local currentIndex = 1
+	for index, folder in ipairs(folders) do
+		if folder.Name == currentPaletteName then
+			currentIndex = index
+			break
+		end
+	end
+	currentIndex = currentIndex % #folders + 1
+	currentPaletteName = folders[currentIndex].Name
+	selectOnlyAsset(nil)
+	refreshLibrary()
+	settings.savePreferences()
+end)
+
+addSelectionButton.Activated:Connect(addSelectionToLibrary)
+refreshButton.Activated:Connect(refreshLibrary)
+multiSelectModeButton.Activated:Connect(function()
+	multiSelectMode = not multiSelectMode
+	if not multiSelectMode and selectedAsset then
+		selectOnlyAsset(selectedAsset)
+	end
+	updateSelectedAssetUI()
+	updateCardHighlights()
+end)
+multiSelectModeButton.MouseLeave:Connect(function()
+	multiSelectModeButton.BackgroundColor3 = multiSelectMode and COLORS.accent or COLORS.panel
+end)
+pivotEditButton.Activated:Connect(startPivotEdit)
+placementPivotButton.Activated:Connect(function()
+	switchTab(false)
+	startPivotEdit()
+end)
+pivotSaveButton.Activated:Connect(function()
+	finishPivotEdit(true)
+end)
+pivotCancelButton.Activated:Connect(function()
+	finishPivotEdit(false)
+end)
+pivotResetButton.Activated:Connect(resetPivotHandle)
+
+libraryTabButton.Activated:Connect(function()
+	if placementActive then
+		stopPlacement(true)
+	end
+	if paintActive or eraseActive then
+		stopBrushMode(true)
+	end
+	switchTab(false)
+end)
+placementTabButton.Activated:Connect(function()
+	switchTab(true)
+end)
+settings.managementTabButton.Activated:Connect(function()
+	if placementActive then
+		stopPlacement(true)
+	end
+	if paintActive or eraseActive then
+		stopBrushMode(true)
+	end
+	switchTab(false, true)
+end)
+settings.managementRefreshButton.Activated:Connect(settings.refreshManagement)
+settings.managementSelectAllButton.Activated:Connect(function()
+	settings.refreshManagement()
+	if settings.managementGenerated and #settings.managementGenerated > 0 then
+		Selection:Set(settings.managementGenerated)
+		settings.managementStatus.Text = string.format(
+			"生成済みプロップを%d個選択しました",
+			#settings.managementGenerated
+		)
+	else
+		settings.managementStatus.Text = "選択できる生成済みプロップがありません"
+	end
+end)
+settings.managementReapplyButton.Activated:Connect(function()
+	settings.reapplyGeneratedSelection(false)
+end)
+settings.managementRandomizeButton.Activated:Connect(function()
+	settings.reapplyGeneratedSelection(true)
+end)
+goPlacementButton.Activated:Connect(function()
+	if not selectedAsset then
+		setLibraryStatus("先にプロップを選択してください", true)
+		return
+	end
+	switchTab(true)
+end)
+backLibraryButton.Activated:Connect(function()
+	if placementActive then
+		stopPlacement(true)
+	end
+	if paintActive or eraseActive then
+		stopBrushMode(true)
+	end
+	switchTab(false)
+end)
+
+settings.presetCycleButton.Activated:Connect(function()
+	settings.refreshPresetUI()
+	if #settings.presetNames == 0 then
+		setPlacementStatus("保存済みプリセットはありません")
+		return
+	end
+	local currentIndex = 0
+	for index, name in ipairs(settings.presetNames) do
+		if name == settings.currentPresetName then
+			currentIndex = index
+			break
+		end
+	end
+	currentIndex = currentIndex % #settings.presetNames + 1
+	settings.currentPresetName = settings.presetNames[currentIndex]
+	settings.presetNameField.Text = settings.currentPresetName
+	settings.refreshPresetUI()
+end)
+settings.presetSaveButton.Activated:Connect(settings.savePreset)
+settings.presetLoadButton.Activated:Connect(settings.loadPreset)
+settings.presetDeleteButton.Activated:Connect(settings.deletePreset)
+
+alignButton.Activated:Connect(function()
+	settings.alignToSurface = not settings.alignToSurface
+	settings.savePreferences()
+	updateSelectedAssetUI()
+	if placementActive then
+		makePreview()
+		updatePreview()
+	end
+end)
+
+settings.rotationSnapButton.Activated:Connect(function()
+	settings.singleRotationSnapEnabled = not settings.singleRotationSnapEnabled
+	readSettings()
+	updateSelectedAssetUI()
+	if placementActive then
+		makePreview()
+		updatePreview()
+	end
+end)
+
+surfaceModeButton.Activated:Connect(function()
+	settings.batchSurfaceMode = settings.batchSurfaceMode == "Top" and "All" or "Top"
+	settings.savePreferences()
+	updateSelectedAssetUI()
+end)
+
+densityModeButton.Activated:Connect(function()
+	settings.densityMode = settings.densityMode == "Maintain" and "Additive" or "Maintain"
+	settings.savePreferences()
+	updateSelectedAssetUI()
+end)
+
+spacingButton.Activated:Connect(function()
+	settings.useMinSpacing = not settings.useMinSpacing
+	settings.savePreferences()
+	updateSelectedAssetUI()
+end)
+
+singlePlacementButton.Activated:Connect(startPlacement)
+paintButton.Activated:Connect(function()
+	startBrushMode("Paint")
+end)
+eraseButton.Activated:Connect(function()
+	startBrushMode("Erase")
+end)
+batchButton.Activated:Connect(batchGenerate)
+
+local function refreshActivePlacementVisuals()
+	if placementActive then
+		makePreview()
+		updatePreview()
+	end
+	if brushVisual then
+		brushVisual.Size = Vector3.new(0.08, settings.brushRadius * 2, settings.brushRadius * 2)
+	end
+end
+
+local function applyNumericValue(key, value)
+	local definition = NUMERIC_BY_KEY[key]
+	local controls = numericControls[key]
+	if not definition or not controls then
+		return
+	end
+	value = math.clamp(roundToStep(value, definition.step), definition.min, definition.max)
+	if key == "scaleMin" then
+		value = math.min(value, settings.scaleMax)
+	elseif key == "scaleMax" then
+		value = math.max(value, settings.scaleMin)
+	elseif key == "yawMin" then
+		value = math.min(value, settings.yawMax)
+	elseif key == "yawMax" then
+		value = math.max(value, settings.yawMin)
+	end
+	controls.field.Text = formatNumericValue(definition, value)
+	readSettings()
+	refreshActivePlacementVisuals()
+end
+
+local function sliderValueFromPointer(definition, sliderButton, pointerX)
+	local width = sliderButton.AbsoluteSize.X
+	if width <= 0 then
+		return nil
+	end
+	local ratio = math.clamp((pointerX - sliderButton.AbsolutePosition.X) / width, 0, 1)
+	local normalized = ratio ^ (definition.curve or 1)
+	return definition.min + (definition.max - definition.min) * normalized
+end
+
+local function sliderValueFromDelta(definition, startValue, deltaPixels, width)
+	if width <= 0 then
+		return startValue
+	end
+	local startNormalized = math.clamp(
+		(startValue - definition.min) / (definition.max - definition.min),
+		0,
+		1
+	)
+	local startRatio = startNormalized ^ (1 / (definition.curve or 1))
+	local ratio = math.clamp(startRatio + deltaPixels / width, 0, 1)
+	local normalized = ratio ^ (definition.curve or 1)
+	return definition.min + (definition.max - definition.min) * normalized
+end
+
+local activeNumericSlider = nil
+
+local function stopActiveNumericSlider()
+	if activeNumericSlider then
+		activeNumericSlider.controls.knob.BackgroundColor3 = COLORS.text
+	end
+	activeNumericSlider = nil
+end
+
+local function beginNumericSlider(key, pointerX, pressInput)
+	stopActiveNumericSlider()
+	local definition = NUMERIC_BY_KEY[key]
+	local controls = numericControls[key]
+	local clickedValue = sliderValueFromPointer(definition, controls.sliderButton, pointerX)
+	if clickedValue then
+		applyNumericValue(key, clickedValue)
+	end
+	activeNumericSlider = {
+		key = key,
+		definition = definition,
+		controls = controls,
+		startValue = tonumber(controls.field.Text) or definition.min,
+		pixelOffset = 0,
+		lastPointerX = nil,
+		pressInput = pressInput,
+	}
+	controls.knob.BackgroundColor3 = COLORS.accentHover
+end
+
+local function handleNumericSliderMovement(input)
+	local drag = activeNumericSlider
+	if not drag then
+		return
+	end
+	local isMouseMovement = input.UserInputType == Enum.UserInputType.MouseMovement
+	local isActiveTouch = input.UserInputType == Enum.UserInputType.Touch and input == drag.pressInput
+	if not isMouseMovement and not isActiveTouch then
+		return
+	end
+	if drag.pressInput and drag.pressInput.UserInputState == Enum.UserInputState.End then
+		stopActiveNumericSlider()
+		return
+	end
+	local pointerX = input.Position.X
+	if drag.lastPointerX then
+		local deltaX = pointerX - drag.lastPointerX
+		local width = drag.controls.sliderButton.AbsoluteSize.X
+		drag.pixelOffset += deltaX
+		applyNumericValue(
+			drag.key,
+			sliderValueFromDelta(drag.definition, drag.startValue, drag.pixelOffset, width)
+		)
+	end
+	if activeNumericSlider then
+		activeNumericSlider.lastPointerX = pointerX
+	end
+end
+
+for _, definition in ipairs(NUMERIC_DEFINITIONS) do
+	local key = definition.key
+	local controls = numericControls[key]
+	controls.reset = function(input)
+		if input.UserInputType ~= Enum.UserInputType.MouseButton2 then
+			return
+		end
+		stopActiveNumericSlider()
+		local defaultValue = tonumber(definition.initial) or definition.min
+		if key == "scaleMin" and settings.scaleMax < defaultValue then
+			applyNumericValue("scaleMax", tonumber(NUMERIC_BY_KEY.scaleMax.initial) or defaultValue)
+		elseif key == "scaleMax" and settings.scaleMin > defaultValue then
+			applyNumericValue("scaleMin", tonumber(NUMERIC_BY_KEY.scaleMin.initial) or defaultValue)
+		elseif key == "yawMin" and settings.yawMax < defaultValue then
+			applyNumericValue("yawMax", tonumber(NUMERIC_BY_KEY.yawMax.initial) or defaultValue)
+		elseif key == "yawMax" and settings.yawMin > defaultValue then
+			applyNumericValue("yawMin", tonumber(NUMERIC_BY_KEY.yawMin.initial) or defaultValue)
+		end
+		applyNumericValue(key, defaultValue)
+		setPlacementStatus(definition.label .. " を初期値に戻しました")
+	end
+	controls.row.InputBegan:Connect(controls.reset)
+	controls.label.InputBegan:Connect(controls.reset)
+	controls.field.InputBegan:Connect(controls.reset)
+	controls.sliderButton.InputBegan:Connect(controls.reset)
+	controls.sliderButton.MouseButton1Up:Connect(function()
+		if activeNumericSlider and activeNumericSlider.controls == controls then
+			stopActiveNumericSlider()
+		end
+	end)
+	controls.sliderButton.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch
+		then
+			beginNumericSlider(key, input.Position.X, input)
+			input:GetPropertyChangedSignal("UserInputState"):Connect(function()
+				if input.UserInputState == Enum.UserInputState.End
+					and activeNumericSlider
+					and activeNumericSlider.pressInput == input
+				then
+					stopActiveNumericSlider()
+				end
+			end)
+		end
+	end)
+	controls.sliderButton.InputChanged:Connect(handleNumericSliderMovement)
+	controls.sliderButton.MouseEnter:Connect(function()
+		controls.knob.BackgroundColor3 = COLORS.accentHover
+	end)
+	controls.sliderButton.MouseLeave:Connect(function()
+		if not activeNumericSlider or activeNumericSlider.controls ~= controls then
+			controls.knob.BackgroundColor3 = COLORS.text
+		end
+	end)
+	controls.field.FocusLost:Connect(function()
+		local entered = tonumber(controls.field.Text)
+		if entered then
+			applyNumericValue(key, entered)
+		else
+			readSettings()
+		end
+	end)
+end
+
+UserInputService.InputChanged:Connect(handleNumericSliderMovement)
+UserInputService.InputChanged:Connect(settings.handleActivePropSliderMovement)
+UserInputService.InputEnded:Connect(function(input)
+	if input.KeyCode == Enum.KeyCode.LeftControl or input.KeyCode == Enum.KeyCode.RightControl then
+		settings.selectionControl = false
+	elseif input.KeyCode == Enum.KeyCode.LeftShift or input.KeyCode == Enum.KeyCode.RightShift then
+		settings.selectionShift = false
+	end
+	if activeNumericSlider and input == activeNumericSlider.pressInput then
+		stopActiveNumericSlider()
+	end
+	if settings.activeWeightDrag
+		and (input == settings.activeWeightDrag.input
+			or input.UserInputType == Enum.UserInputType.MouseButton1)
+	then
+		settings.stopActivePropSlider()
+	end
+end)
+UserInputService.WindowFocusReleased:Connect(function()
+	stopActiveNumericSlider()
+	settings.stopActivePropSlider()
+end)
+
+mouse.Button1Down:Connect(function()
+	if placementActive then
+		if previewHitPosition and previewHitNormal then
+			settings.singleRotationDragging = true
+			settings.singleRotationLastX = mouse.X
+			setPlacementStatus("左右ドラッグで回転し、左ボタンを離すと配置します")
+		end
+	elseif paintActive or eraseActive then
+		beginStroke()
+	end
+end)
+
+mouse.Move:Connect(function()
+	if not placementActive or not settings.singleRotationDragging or not settings.singleRotationLastX then
+		return
+	end
+	local currentX = mouse.X
+	local deltaX = currentX - settings.singleRotationLastX
+	settings.singleRotationLastX = currentX
+	if deltaX == 0 then
+		return
+	end
+	local fineAdjustment = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+		or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+	local degreesPerPixel = fineAdjustment and 0.15 or 0.5
+	settings.singleYawOffset += deltaX * degreesPerPixel
+	updatePreview()
+	local _, yaw = randomTransform(previewSeed, previewAsset)
+	yaw += settings.singleYawOffset
+	if settings.singleRotationSnapEnabled then
+		yaw = math.round(yaw / settings.rotationSnapAngle) * settings.rotationSnapAngle
+	end
+	setPlacementStatus(string.format("Y回転: %.1f°　左ボタンを離すと配置", yaw % 360))
+end)
+
+mouse.Button1Up:Connect(function()
+	if placementActive and settings.singleRotationDragging then
+		settings.singleRotationDragging = false
+		settings.singleRotationLastX = nil
+		placePreviewProp()
+	elseif strokeActive then
+		finishStroke()
+	end
+end)
+
+UserInputService.InputBegan:Connect(function(input, processed)
+	if input.KeyCode == Enum.KeyCode.LeftControl or input.KeyCode == Enum.KeyCode.RightControl then
+		settings.selectionControl = true
+	elseif input.KeyCode == Enum.KeyCode.LeftShift or input.KeyCode == Enum.KeyCode.RightShift then
+		settings.selectionShift = true
+	end
+	if input.UserInputType == Enum.UserInputType.MouseButton2 then
+		stopActiveNumericSlider()
+	end
+	local focusedTextBox = UserInputService:GetFocusedTextBox()
+	if not focusedTextBox and input.KeyCode == Enum.KeyCode.Escape then
+		if placementActive then
+			stopPlacement(false)
+		elseif paintActive or eraseActive then
+			stopBrushMode(false)
+		elseif pivotSession then
+			finishPivotEdit(false)
+		end
+		return
+	end
+	if not focusedTextBox and (placementActive or paintActive or eraseActive) then
+		if input.KeyCode == brushDecreaseKey then
+			adjustActiveSize(-1)
+			return
+		elseif input.KeyCode == brushIncreaseKey then
+			adjustActiveSize(1)
+			return
+		end
+	end
+	if processed or focusedTextBox then
+		return
+	end
+end)
+
+plugin.Deactivation:Connect(function()
+	if placementActive then
+		stopPlacement(true)
+	end
+	if paintActive or eraseActive then
+		stopBrushMode(true)
+	end
+end)
+
+toolbarButton.Click:Connect(function()
+	widget.Enabled = not widget.Enabled
+	toolbarButton:SetActive(widget.Enabled)
+	if widget.Enabled then
+		refreshLibrary()
+	end
+end)
+
+widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+	toolbarButton:SetActive(widget.Enabled)
+	if not widget.Enabled then
+		if placementActive then
+			stopPlacement(true)
+		end
+		if paintActive or eraseActive then
+			stopBrushMode(true)
+		end
+		if pivotSession then
+			finishPivotEdit(false)
+		end
+	end
+end)
+
+libraryRoot().DescendantAdded:Connect(function()
+	task.defer(function()
+		if widget.Enabled and not pivotSession then
+			refreshLibrary()
+		end
+	end)
+end)
+
+libraryRoot().DescendantRemoving:Connect(function()
+	task.defer(function()
+		if widget.Enabled and not pivotSession then
+			refreshLibrary()
+		end
+	end)
+end)
+
+settings.syncFieldsFromSettings()
+settings.refreshPresetUI()
+switchTab(false)
+refreshLibrary()
