@@ -5,6 +5,7 @@ Roblox Studio 用のプラグインです。木・岩・草・小物といった
 - Version: `0.7.2`
 - 対応環境: Roblox Studio（プラグインとしてインストール）
 - UI言語: 日本語
+- 配布形式: `PropPainter_PluginPackage.rbxmx`（そのままPluginsフォルダに置けば動作。`PropPainter.plugin.lua`は中身のスクリプトのみを取り出したソースコード版で、外部依存はなくこちらを直接置いても動作します）
 
 ## 目次
 
